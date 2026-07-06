@@ -23,6 +23,7 @@ option(PTH_BUILD_PTHREAD "Build POSIX pthread emulation library"      OFF)
 option(PTH_DEBUG         "Enable Pth debugging"                       OFF)
 option(PTH_SYSCALL_SOFT  "Enable soft system call mapping"            OFF)
 option(PTH_SYSCALL_HARD  "Enable hard system call mapping"            OFF)
+option(PTH_MP            "Enable multi-scheduler (multi-CPU) support" OFF)
 # BUILD_SHARED_LIBS selects static (default) vs shared library
 
 # mctx overrides (equivalent to --with-mctx-mth/dsp/stk); empty = autodetect
@@ -177,7 +178,6 @@ endif()
 
 # -- runtime probes ----------------------------------------------------------
 set(_probes "${CMAKE_CURRENT_SOURCE_DIR}/cmake/probes")
-
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/probes")
 
 function(pth_run_probe src outvar default)
@@ -267,6 +267,34 @@ set(PTH_MCTX_MTH_RESOLVED "${_mth}")
 set(PTH_MCTX_DSP_RESOLVED "${_dsp}")
 set(PTH_MCTX_STK_RESOLVED "${_stk}")
 message(STATUS "Pth mctx implementation: ${_mth}/${_dsp}/${_stk}")
+
+# -- multi-scheduler (MP) requirements ----------------------------------------
+if(PTH_MP)
+    # the sjlj mctx variants bootstrap stacks via process-global state and a
+    # SIGUSR1 handler, which is unsafe with concurrent schedulers (see
+    # MULTISCHED-DESIGN.md section 7): require the reentrant makecontext variant
+    if(NOT _mth STREQUAL "mcsc")
+        message(FATAL_ERROR "PTH_MP requires the mcsc (makecontext/swapcontext) "
+                            "mctx method; detected/forced: ${_mth}/${_dsp}/${_stk}")
+    endif()
+    check_c_source_compiles("
+        #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
+        #include <stdatomic.h>
+        static atomic_int x;
+        #elif defined(__GNUC__) || defined(__clang__)
+        static int x;
+        #else
+        #error no atomics
+        #endif
+        static __thread int t;
+        int main(void) { t = 1; return 0; }"
+        PTH_MP_TOOLCHAIN_OK)
+    if(NOT PTH_MP_TOOLCHAIN_OK)
+        message(FATAL_ERROR "PTH_MP requires C11 atomics or GCC/Clang __atomic "
+                            "builtins plus __thread TLS support")
+    endif()
+    find_package(Threads REQUIRED)
+endif()
 
 # sig{set,long}jmp flavor (for pth_acmac.h)
 if(_dsp MATCHES "^(ssjlj|sjljlx|sjljisc|sjljw32)$" OR (_dsp STREQUAL "sc" AND HAVE_SIGSETJMP))
@@ -375,6 +403,7 @@ add_custom_command(
             -Dcpp -Cintern -M "==#==" ${_hsrc_paths}
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/pth_p.h.in" ${_hsrc_paths}
             "${CMAKE_CURRENT_SOURCE_DIR}/shtool"
+            "${CMAKE_CURRENT_SOURCE_DIR}/pth_atomic.h"
     COMMENT "Generating pth_p.h (shtool scpp)"
     VERBATIM)
 add_custom_target(pth_p_h DEPENDS "${GEN}/pth_p.h")
@@ -388,8 +417,12 @@ set(PTH_SOURCES
 
 add_library(pth ${PTH_SOURCES})
 add_dependencies(pth pth_p_h)
-target_include_directories(pth PUBLIC "${GEN}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(pth PUBLIC "${GEN}" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(pth PUBLIC ${PTH_EXTRA_LIBS})
+if(PTH_MP)
+    target_compile_definitions(pth PUBLIC PTH_MP)
+    target_link_libraries(pth PUBLIC Threads::Threads)
+endif()
 set_target_properties(pth PROPERTIES
     VERSION "${PTH_VERSION_SHORT}"
     POSITION_INDEPENDENT_CODE ON)
@@ -397,8 +430,12 @@ set_target_properties(pth PROPERTIES
 if(PTH_BUILD_PTHREAD)
     add_library(pth_pthread ${PTH_SOURCES} pthread.c)
     add_dependencies(pth_pthread pth_p_h)
-    target_include_directories(pth_pthread PUBLIC "${GEN}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(pth_pthread PUBLIC "${GEN}" "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(pth_pthread PUBLIC ${PTH_EXTRA_LIBS})
+    if(PTH_MP)
+        target_compile_definitions(pth_pthread PUBLIC PTH_MP)
+        target_link_libraries(pth_pthread PUBLIC Threads::Threads)
+    endif()
     set_target_properties(pth_pthread PROPERTIES
         OUTPUT_NAME pthread
         VERSION "${PTH_VERSION_SHORT}"

@@ -30,12 +30,17 @@
 
 #define PTH_TCB_NAMELEN 40
 
+struct pth_gsched_st; /* forward (defined in pth_sched.c) */
+
     /* thread control block */
 struct pth_st {
     /* priority queue handling */
     pth_t          q_next;               /* next thread in pool                         */
     pth_t          q_prev;               /* previous thread in pool                     */
     int            q_prio;               /* (relative) priority of thread when queued   */
+
+    /* scheduler binding (MP support; a thread never migrates) */
+    struct pth_gsched_st *sched_home;    /* home scheduler of this thread               */
 
     /* standard thread control block ingredients */
     int            prio;                 /* base priority of thread                     */
@@ -108,6 +113,7 @@ intern pth_t pth_tcb_alloc(unsigned int stacksize, void *stackaddr)
         stacksize = SIGSTKSZ;
     if ((t = (pth_t)malloc(sizeof(struct pth_st))) == NULL)
         return NULL;
+    t->sched_home = NULL;
     t->stacksize  = stacksize;
     t->stack      = NULL;
     t->stackguard = NULL;

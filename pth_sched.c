@@ -27,54 +27,89 @@
                                      -- Unknown   */
 #include "pth_p.h"
 
-intern pth_t        pth_main;       /* the main thread                       */
-intern pth_t        pth_sched;      /* the permanent scheduler thread        */
-intern pth_t        pth_current;    /* the currently running thread          */
-intern pth_pqueue_t pth_NQ;         /* queue of new threads                  */
-intern pth_pqueue_t pth_RQ;         /* queue of threads ready to run         */
-intern pth_pqueue_t pth_WQ;         /* queue of threads waiting for an event */
-intern pth_pqueue_t pth_SQ;         /* queue of suspended threads            */
-intern pth_pqueue_t pth_DQ;         /* queue of terminated threads           */
-intern int          pth_favournew;  /* favour new threads on startup         */
-intern float        pth_loadval;    /* average scheduler load value          */
+#if cpp
 
-static int          pth_sigpipe[2]; /* internal signal occurrence pipe       */
-static sigset_t     pth_sigpending; /* mask of pending signals               */
-static sigset_t     pth_sigblock;   /* mask of signals we block in scheduler */
-static sigset_t     pth_sigcatch;   /* mask of signals we have to catch      */
-static sigset_t     pth_sigraised;  /* mask of raised signals                */
+/*
+ * The scheduler object: all per-scheduler state lives here so that
+ * multiple schedulers (one per OS thread) can coexist (see
+ * MULTISCHED-DESIGN.md). Classic Pth kept this state in globals.
+ */
+typedef struct pth_gsched_st pth_gsched_t;
+struct pth_gsched_st {
+    int          id;           /* scheduler identifier                  */
+    pth_t        main;         /* the main thread                       */
+    pth_t        sched;        /* the permanent scheduler thread        */
+    pth_t        current;      /* the currently running thread          */
+    pth_pqueue_t NQ;           /* queue of new threads                  */
+    pth_pqueue_t RQ;           /* queue of threads ready to run         */
+    pth_pqueue_t WQ;           /* queue of threads waiting for an event */
+    pth_pqueue_t SQ;           /* queue of suspended threads            */
+    pth_pqueue_t DQ;           /* queue of terminated threads           */
+    int          favournew;    /* favour new threads on startup         */
+    float        loadval;      /* average scheduler load value          */
+    int          sigpipe[2];   /* internal signal occurrence pipe       */
+    sigset_t     sigpending;   /* mask of pending signals               */
+    sigset_t     sigblock;     /* mask of signals we block in scheduler */
+    sigset_t     sigcatch;     /* mask of signals we have to catch      */
+    sigset_t     sigraised;    /* mask of raised signals                */
+    pth_time_t   loadticknext; /* next time point for load calculation  */
+    pth_time_t   loadtickgap;  /* interval between load calculations    */
+};
 
-static pth_time_t   pth_loadticknext;
-static pth_time_t   pth_loadtickgap = PTH_TIME(1,0);
+/*
+ * Single-scheduler source compatibility: the classic global names resolve
+ * through the scheduler object of the calling OS thread. Keep using these
+ * names in code that means "my scheduler"; code that operates on an
+ * explicitly given scheduler should take a pth_gsched_t* instead.
+ */
+#define pth_main      (pth_gsched_active->main)
+#define pth_sched     (pth_gsched_active->sched)
+#define pth_current   (pth_gsched_active->current)
+#define pth_NQ        (pth_gsched_active->NQ)
+#define pth_RQ        (pth_gsched_active->RQ)
+#define pth_WQ        (pth_gsched_active->WQ)
+#define pth_SQ        (pth_gsched_active->SQ)
+#define pth_DQ        (pth_gsched_active->DQ)
+#define pth_favournew (pth_gsched_active->favournew)
+#define pth_loadval   (pth_gsched_active->loadval)
+
+#endif /* cpp */
+
+intern pth_gsched_t  pth_gsched_pri;                      /* the primary scheduler            */
+intern pth_gsched_t *pth_gsched_active = &pth_gsched_pri; /* scheduler of this OS thread      */
 
 /* initialize the scheduler ingredients */
 intern int pth_scheduler_init(void)
 {
+    pth_gsched_t *g = pth_gsched_active;
+    pth_time_t gap = PTH_TIME(1,0);
+
     /* create the internal signal pipe */
-    if (pipe(pth_sigpipe) == -1)
+    if (pipe(g->sigpipe) == -1)
         return pth_error(FALSE, errno);
-    if (pth_fdmode(pth_sigpipe[0], PTH_FDMODE_NONBLOCK) == PTH_FDMODE_ERROR)
+    if (pth_fdmode(g->sigpipe[0], PTH_FDMODE_NONBLOCK) == PTH_FDMODE_ERROR)
         return pth_error(FALSE, errno);
-    if (pth_fdmode(pth_sigpipe[1], PTH_FDMODE_NONBLOCK) == PTH_FDMODE_ERROR)
+    if (pth_fdmode(g->sigpipe[1], PTH_FDMODE_NONBLOCK) == PTH_FDMODE_ERROR)
         return pth_error(FALSE, errno);
 
     /* initialize the essential threads */
-    pth_sched   = NULL;
-    pth_current = NULL;
+    g->sched   = NULL;
+    g->current = NULL;
 
     /* initalize the thread queues */
-    pth_pqueue_init(&pth_NQ);
-    pth_pqueue_init(&pth_RQ);
-    pth_pqueue_init(&pth_WQ);
-    pth_pqueue_init(&pth_SQ);
-    pth_pqueue_init(&pth_DQ);
+    pth_pqueue_init(&g->NQ);
+    pth_pqueue_init(&g->RQ);
+    pth_pqueue_init(&g->WQ);
+    pth_pqueue_init(&g->SQ);
+    pth_pqueue_init(&g->DQ);
 
     /* initialize scheduling hints */
-    pth_favournew = 1; /* the default is the original behaviour */
+    g->favournew = 1; /* the default is the original behaviour */
 
     /* initialize load support */
-    pth_loadval = 1.0;
-    pth_time_set(&pth_loadticknext, PTH_TIME_NOW);
+    g->loadval = 1.0;
+    pth_time_set(&g->loadtickgap, &gap);
+    pth_time_set(&g->loadticknext, PTH_TIME_NOW);
 
     return TRUE;
 }
@@ -82,47 +117,49 @@ intern int pth_scheduler_init(void)
 /* drop all threads (except for the currently active one) */
 intern void pth_scheduler_drop(void)
 {
+    pth_gsched_t *g = pth_gsched_active;
     pth_t t;
 
     /* clear the new queue */
-    while ((t = pth_pqueue_delmax(&pth_NQ)) != NULL)
+    while ((t = pth_pqueue_delmax(&g->NQ)) != NULL)
         pth_tcb_free(t);
-    pth_pqueue_init(&pth_NQ);
+    pth_pqueue_init(&g->NQ);
 
     /* clear the ready queue */
-    while ((t = pth_pqueue_delmax(&pth_RQ)) != NULL)
+    while ((t = pth_pqueue_delmax(&g->RQ)) != NULL)
         pth_tcb_free(t);
-    pth_pqueue_init(&pth_RQ);
+    pth_pqueue_init(&g->RQ);
 
     /* clear the waiting queue */
-    while ((t = pth_pqueue_delmax(&pth_WQ)) != NULL)
+    while ((t = pth_pqueue_delmax(&g->WQ)) != NULL)
         pth_tcb_free(t);
-    pth_pqueue_init(&pth_WQ);
+    pth_pqueue_init(&g->WQ);
 
     /* clear the suspend queue */
-    while ((t = pth_pqueue_delmax(&pth_SQ)) != NULL)
+    while ((t = pth_pqueue_delmax(&g->SQ)) != NULL)
         pth_tcb_free(t);
-    pth_pqueue_init(&pth_SQ);
+    pth_pqueue_init(&g->SQ);
 
     /* clear the dead queue */
-    while ((t = pth_pqueue_delmax(&pth_DQ)) != NULL)
+    while ((t = pth_pqueue_delmax(&g->DQ)) != NULL)
         pth_tcb_free(t);
-    pth_pqueue_init(&pth_DQ);
+    pth_pqueue_init(&g->DQ);
     return;
 }
 
 /* kill the scheduler ingredients */
 intern void pth_scheduler_kill(void)
 {
+    pth_gsched_t *g = pth_gsched_active;
+
     /* drop all threads */
     pth_scheduler_drop();
 
     /* remove the internal signal pipe */
-    close(pth_sigpipe[0]);
-    close(pth_sigpipe[1]);
+    close(g->sigpipe[0]);
+    close(g->sigpipe[1]);
     return;
 }
-
 /*
  * Update the average scheduler load.
  *
@@ -138,23 +175,24 @@ intern void pth_scheduler_kill(void)
  * The actual average load is calculated through an exponential average
  * formula.
  */
-#define pth_scheduler_load(now) \
-    if (pth_time_cmp((now), &pth_loadticknext) >= 0) { \
+#define pth_scheduler_load(g, now) \
+    if (pth_time_cmp((now), &g->loadticknext) >= 0) { \
         pth_time_t ttmp; \
         int numready; \
-        numready = pth_pqueue_elements(&pth_RQ); \
+        numready = pth_pqueue_elements(&g->RQ); \
         pth_time_set(&ttmp, (now)); \
         do { \
-            pth_loadval = (numready*0.25) + (pth_loadval*0.75); \
-            pth_time_sub(&ttmp, &pth_loadtickgap); \
-        } while (pth_time_cmp(&ttmp, &pth_loadticknext) >= 0); \
-        pth_time_set(&pth_loadticknext, (now)); \
-        pth_time_add(&pth_loadticknext, &pth_loadtickgap); \
+            g->loadval = (numready*0.25) + (g->loadval*0.75); \
+            pth_time_sub(&ttmp, &g->loadtickgap); \
+        } while (pth_time_cmp(&ttmp, &g->loadticknext) >= 0); \
+        pth_time_set(&g->loadticknext, (now)); \
+        pth_time_add(&g->loadticknext, &g->loadtickgap); \
     }
 
 /* the heart of this library: the thread scheduler */
 intern void *pth_scheduler(void *dummy)
 {
+    pth_gsched_t *g = pth_gsched_active;
     sigset_t sigs;
     pth_time_t running;
     pth_time_t snapshot;
@@ -169,7 +207,7 @@ intern void *pth_scheduler(void *dummy)
     pth_debug1("pth_scheduler: bootstrapping");
 
     /* mark this thread as the special scheduler thread */
-    pth_sched->state = PTH_STATE_SCHEDULER;
+    g->sched->state = PTH_STATE_SCHEDULER;
 
     /* block all signals in the scheduler thread */
     sigfillset(&sigs);
@@ -186,48 +224,48 @@ intern void *pth_scheduler(void *dummy)
          * Move threads from new queue to ready queue and optionally
          * give them maximum priority so they start immediately.
          */
-        while ((t = pth_pqueue_tail(&pth_NQ)) != NULL) {
-            pth_pqueue_delete(&pth_NQ, t);
+        while ((t = pth_pqueue_tail(&g->NQ)) != NULL) {
+            pth_pqueue_delete(&g->NQ, t);
             t->state = PTH_STATE_READY;
-            if (pth_favournew)
-                pth_pqueue_insert(&pth_RQ, pth_pqueue_favorite_prio(&pth_RQ), t);
+            if (g->favournew)
+                pth_pqueue_insert(&g->RQ, pth_pqueue_favorite_prio(&g->RQ), t);
             else
-                pth_pqueue_insert(&pth_RQ, PTH_PRIO_STD, t);
+                pth_pqueue_insert(&g->RQ, PTH_PRIO_STD, t);
             pth_debug2("pth_scheduler: new thread \"%s\" moved to top of ready queue", t->name);
         }
 
         /*
          * Update average scheduler load
          */
-        pth_scheduler_load(&snapshot);
+        pth_scheduler_load(g, &snapshot);
 
         /*
          * Find next thread in ready queue
          */
-        pth_current = pth_pqueue_delmax(&pth_RQ);
-        if (pth_current == NULL) {
+        g->current = pth_pqueue_delmax(&g->RQ);
+        if (g->current == NULL) {
             fprintf(stderr, "**Pth** SCHEDULER INTERNAL ERROR: "
                             "no more thread(s) available to schedule!?!?\n");
             abort();
         }
         pth_debug4("pth_scheduler: thread \"%s\" selected (prio=%d, qprio=%d)",
-                   pth_current->name, pth_current->prio, pth_current->q_prio);
+                   g->current->name, g->current->prio, g->current->q_prio);
 
         /*
          * Raise additionally thread-specific signals
          * (they are delivered when we switch the context)
          *
          * Situation is ('#' = signal pending):
-         *     process pending (pth_sigpending):         ----####
-         *     thread pending (pth_current->sigpending): --##--##
+         *     process pending (g->sigpending):         ----####
+         *     thread pending (g->current->sigpending): --##--##
          * Result has to be:
          *     process new pending:                      --######
          */
-        if (pth_current->sigpendcnt > 0) {
-            sigpending(&pth_sigpending);
+        if (g->current->sigpendcnt > 0) {
+            sigpending(&g->sigpending);
             for (sig = 1; sig < PTH_NSIG; sig++)
-                if (sigismember(&pth_current->sigpending, sig))
-                    if (!sigismember(&pth_sigpending, sig))
+                if (sigismember(&g->current->sigpending, sig))
+                    if (!sigismember(&g->sigpending, sig))
                         kill(getpid(), sig);
         }
 
@@ -236,57 +274,57 @@ intern void *pth_scheduler(void *dummy)
          * and perform a context switch to it
          */
         pth_debug3("pth_scheduler: switching to thread 0x%lx (\"%s\")",
-                   (unsigned long)pth_current, pth_current->name);
+                   (unsigned long)g->current, g->current->name);
 
         /* update thread times */
-        pth_time_set(&pth_current->lastran, PTH_TIME_NOW);
+        pth_time_set(&g->current->lastran, PTH_TIME_NOW);
 
         /* update scheduler times */
-        pth_time_set(&running, &pth_current->lastran);
+        pth_time_set(&running, &g->current->lastran);
         pth_time_sub(&running, &snapshot);
-        pth_time_add(&pth_sched->running, &running);
+        pth_time_add(&g->sched->running, &running);
 
         /* ** ENTERING THREAD ** - by switching the machine context */
-        pth_current->dispatches++;
-        pth_mctx_switch(&pth_sched->mctx, &pth_current->mctx);
+        g->current->dispatches++;
+        pth_mctx_switch(&g->sched->mctx, &g->current->mctx);
 
         /* update scheduler times */
         pth_time_set(&snapshot, PTH_TIME_NOW);
         pth_debug3("pth_scheduler: cameback from thread 0x%lx (\"%s\")",
-                   (unsigned long)pth_current, pth_current->name);
+                   (unsigned long)g->current, g->current->name);
 
         /*
          * Calculate and update the time the previous thread was running
          */
         pth_time_set(&running, &snapshot);
-        pth_time_sub(&running, &pth_current->lastran);
-        pth_time_add(&pth_current->running, &running);
+        pth_time_sub(&running, &g->current->lastran);
+        pth_time_add(&g->current->running, &running);
         pth_debug3("pth_scheduler: thread \"%s\" ran %.6f",
-                   pth_current->name, pth_time_t2d(&running));
+                   g->current->name, pth_time_t2d(&running));
 
         /*
          * Remove still pending thread-specific signals
          * (they are re-delivered next time)
          *
          * Situation is ('#' = signal pending):
-         *     thread old pending (pth_current->sigpending): --##--##
-         *     process old pending (pth_sigpending):         ----####
+         *     thread old pending (g->current->sigpending): --##--##
+         *     process old pending (g->sigpending):         ----####
          *     process still pending (sigstillpending):      ---#-#-#
          * Result has to be:
          *     process new pending:                          -----#-#
-         *     thread new pending (pth_current->sigpending): ---#---#
+         *     thread new pending (g->current->sigpending): ---#---#
          */
-        if (pth_current->sigpendcnt > 0) {
+        if (g->current->sigpendcnt > 0) {
             sigset_t sigstillpending;
             sigpending(&sigstillpending);
             for (sig = 1; sig < PTH_NSIG; sig++) {
-                if (sigismember(&pth_current->sigpending, sig)) {
+                if (sigismember(&g->current->sigpending, sig)) {
                     if (!sigismember(&sigstillpending, sig)) {
                         /* thread (and perhaps also process) signal delivered */
-                        sigdelset(&pth_current->sigpending, sig);
-                        pth_current->sigpendcnt--;
+                        sigdelset(&g->current->sigpending, sig);
+                        g->current->sigpendcnt--;
                     }
-                    else if (!sigismember(&pth_sigpending, sig)) {
+                    else if (!sigismember(&g->sigpending, sig)) {
                         /* thread signal not delivered */
                         pth_util_sigdelete(sig);
                     }
@@ -297,10 +335,10 @@ intern void *pth_scheduler(void *dummy)
         /*
          * Check for stack overflow
          */
-        if (pth_current->stackguard != NULL) {
-            if (*pth_current->stackguard != 0xDEAD) {
+        if (g->current->stackguard != NULL) {
+            if (*g->current->stackguard != 0xDEAD) {
                 pth_debug3("pth_scheduler: stack overflow detected for thread 0x%lx (\"%s\")",
-                           (unsigned long)pth_current, pth_current->name);
+                           (unsigned long)g->current, g->current->name);
                 /*
                  * if the application doesn't catch SIGSEGVs, we terminate
                  * manually with a SIGSEGV now, but output a reasonable message.
@@ -308,7 +346,7 @@ intern void *pth_scheduler(void *dummy)
                 if (sigaction(SIGSEGV, NULL, &sa) == 0) {
                     if (sa.sa_handler == SIG_DFL) {
                         fprintf(stderr, "**Pth** STACK OVERFLOW: thread pid_t=0x%lx, name=\"%s\"\n",
-                                (unsigned long)pth_current, pth_current->name);
+                                (unsigned long)g->current, g->current->name);
                         kill(getpid(), SIGSEGV);
                         sigfillset(&ss);
                         sigdelset(&ss, SIGSEGV);
@@ -320,8 +358,8 @@ intern void *pth_scheduler(void *dummy)
                  * else we terminate the thread only and send us a SIGSEGV
                  * which allows the application to handle the situation...
                  */
-                pth_current->join_arg = (void *)0xDEAD;
-                pth_current->state = PTH_STATE_DEAD;
+                g->current->join_arg = (void *)0xDEAD;
+                g->current->state = PTH_STATE_DEAD;
                 kill(getpid(), SIGSEGV);
             }
         }
@@ -329,24 +367,24 @@ intern void *pth_scheduler(void *dummy)
         /*
          * If previous thread is now marked as dead, kick it out
          */
-        if (pth_current->state == PTH_STATE_DEAD) {
-            pth_debug2("pth_scheduler: marking thread \"%s\" as dead", pth_current->name);
-            if (!pth_current->joinable)
-                pth_tcb_free(pth_current);
+        if (g->current->state == PTH_STATE_DEAD) {
+            pth_debug2("pth_scheduler: marking thread \"%s\" as dead", g->current->name);
+            if (!g->current->joinable)
+                pth_tcb_free(g->current);
             else
-                pth_pqueue_insert(&pth_DQ, PTH_PRIO_STD, pth_current);
-            pth_current = NULL;
+                pth_pqueue_insert(&g->DQ, PTH_PRIO_STD, g->current);
+            g->current = NULL;
         }
 
         /*
          * If thread wants to wait for an event
          * move it to waiting queue now
          */
-        if (pth_current != NULL && pth_current->state == PTH_STATE_WAITING) {
+        if (g->current != NULL && g->current->state == PTH_STATE_WAITING) {
             pth_debug2("pth_scheduler: moving thread \"%s\" to waiting queue",
-                       pth_current->name);
-            pth_pqueue_insert(&pth_WQ, pth_current->prio, pth_current);
-            pth_current = NULL;
+                       g->current->name);
+            pth_pqueue_insert(&g->WQ, g->current->prio, g->current);
+            g->current = NULL;
         }
 
         /*
@@ -354,17 +392,17 @@ intern void *pth_scheduler(void *dummy)
          * priorities to avoid starvation and insert last running
          * thread back into this queue, too.
          */
-        pth_pqueue_increase(&pth_RQ);
-        if (pth_current != NULL)
-            pth_pqueue_insert(&pth_RQ, pth_current->prio, pth_current);
+        pth_pqueue_increase(&g->RQ);
+        if (g->current != NULL)
+            pth_pqueue_insert(&g->RQ, g->current->prio, g->current);
 
         /*
          * Manage the events in the waiting queue, i.e. decide whether their
          * events occurred and move them to the ready queue. But wait only if
          * we have already no new or ready threads.
          */
-        if (   pth_pqueue_elements(&pth_RQ) == 0
-            && pth_pqueue_elements(&pth_NQ) == 0)
+        if (   pth_pqueue_elements(&g->RQ) == 0
+            && pth_pqueue_elements(&g->NQ) == 0)
             /* still no NEW or READY threads, so we have to wait for new work */
             pth_sched_eventmanager(&snapshot, FALSE /* wait */);
         else
@@ -382,6 +420,7 @@ intern void *pth_scheduler(void *dummy)
  */
 intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
 {
+    pth_gsched_t *g = pth_gsched_active;
     pth_t nexttimer_thread;
     pth_event_t nexttimer_ev;
     pth_time_t nexttimer_value;
@@ -420,10 +459,10 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     fdmax = -1;
 
     /* initialize signal status */
-    sigpending(&pth_sigpending);
-    sigfillset(&pth_sigblock);
-    sigemptyset(&pth_sigcatch);
-    sigemptyset(&pth_sigraised);
+    sigpending(&g->sigpending);
+    sigfillset(&g->sigblock);
+    sigemptyset(&g->sigcatch);
+    sigemptyset(&g->sigraised);
 
     /* initialize next timer */
     pth_time_set(&nexttimer_value, PTH_TIME_ZERO);
@@ -432,13 +471,13 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
 
     /* for all threads in the waiting queue... */
     any_occurred = FALSE;
-    for (t = pth_pqueue_head(&pth_WQ); t != NULL;
-         t = pth_pqueue_walk(&pth_WQ, t, PTH_WALK_NEXT)) {
+    for (t = pth_pqueue_head(&g->WQ); t != NULL;
+         t = pth_pqueue_walk(&g->WQ, t, PTH_WALK_NEXT)) {
 
         /* determine signals we block */
         for (sig = 1; sig < PTH_NSIG; sig++)
             if (!sigismember(&(t->mctx.sigs), sig))
-                sigdelset(&pth_sigblock, sig);
+                sigdelset(&g->sigblock, sig);
 
         /* cancellation support */
         if (t->cancelreq == TRUE)
@@ -489,16 +528,16 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
                                 this_occurred = TRUE;
                             }
                             /* process signal handling */
-                            if (sigismember(&pth_sigpending, sig)) {
+                            if (sigismember(&g->sigpending, sig)) {
                                 if (ev->ev_args.SIGS.sig != NULL)
                                     *(ev->ev_args.SIGS.sig) = sig;
                                 pth_util_sigdelete(sig);
-                                sigdelset(&pth_sigpending, sig);
+                                sigdelset(&g->sigpending, sig);
                                 this_occurred = TRUE;
                             }
                             else {
-                                sigdelset(&pth_sigblock, sig);
-                                sigaddset(&pth_sigcatch, sig);
+                                sigdelset(&g->sigblock, sig);
+                                sigaddset(&g->sigcatch, sig);
                             }
                         }
                     }
@@ -543,7 +582,7 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
                 /* Thread Termination */
                 else if (ev->ev_type == PTH_EVENT_TID) {
                     if (   (   ev->ev_args.TID.tid == NULL
-                            && pth_pqueue_elements(&pth_DQ) > 0)
+                            && pth_pqueue_elements(&g->DQ) > 0)
                         || (   ev->ev_args.TID.tid != NULL
                             && ev->ev_args.TID.tid->state == ev->ev_goal))
                         this_occurred = TRUE;
@@ -598,14 +637,14 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     }
 
     /* clear pipe and let select() wait for the read-part of the pipe */
-    while (pth_sc(read)(pth_sigpipe[0], minibuf, sizeof(minibuf)) > 0) ;
-    FD_SET(pth_sigpipe[0], &rfds);
-    if (fdmax < pth_sigpipe[0])
-        fdmax = pth_sigpipe[0];
+    while (pth_sc(read)(g->sigpipe[0], minibuf, sizeof(minibuf)) > 0) ;
+    FD_SET(g->sigpipe[0], &rfds);
+    if (fdmax < g->sigpipe[0])
+        fdmax = g->sigpipe[0];
 
     /* replace signal actions for signals we've to catch for events */
     for (sig = 1; sig < PTH_NSIG; sig++) {
-        if (sigismember(&pth_sigcatch, sig)) {
+        if (sigismember(&g->sigcatch, sig)) {
             sa.sa_handler = pth_sched_eventmanager_sighandler;
             sigfillset(&sa.sa_mask);
             sa.sa_flags = 0;
@@ -616,7 +655,7 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     /* allow some signals to be delivered: Either to our
        catching handler or directly to the configured
        handler for signals not catched by events */
-    pth_sc(sigprocmask)(SIG_SETMASK, &pth_sigblock, &oss);
+    pth_sc(sigprocmask)(SIG_SETMASK, &g->sigblock, &oss);
 
     /* now do the polling for filedescriptor I/O and timers
        WHEN THE SCHEDULER SLEEPS AT ALL, THEN HERE!! */
@@ -628,7 +667,7 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     /* restore signal mask and actions and handle signals */
     pth_sc(sigprocmask)(SIG_SETMASK, &oss, NULL);
     for (sig = 1; sig < PTH_NSIG; sig++)
-        if (sigismember(&pth_sigcatch, sig))
+        if (sigismember(&g->sigcatch, sig))
             sigaction(sig, &osa[sig], NULL);
 
     /* if the timer elapsed, handle it */
@@ -647,8 +686,8 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     }
 
     /* if the internal signal pipe was used, adjust the select() results */
-    if (!dopoll && rc > 0 && FD_ISSET(pth_sigpipe[0], &rfds)) {
-        FD_CLR(pth_sigpipe[0], &rfds);
+    if (!dopoll && rc > 0 && FD_ISSET(g->sigpipe[0], &rfds)) {
+        FD_CLR(g->sigpipe[0], &rfds);
         rc--;
     }
 
@@ -665,7 +704,7 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
        waiting queue to the ready queue */
 
     /* for all threads in the waiting queue... */
-    t = pth_pqueue_head(&pth_WQ);
+    t = pth_pqueue_head(&g->WQ);
     while (t != NULL) {
 
         /* do the late handling of the fd I/O and signal
@@ -769,12 +808,12 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
                     else if (ev->ev_type == PTH_EVENT_SIGS) {
                         for (sig = 1; sig < PTH_NSIG; sig++) {
                             if (sigismember(ev->ev_args.SIGS.sigs, sig)) {
-                                if (sigismember(&pth_sigraised, sig)) {
+                                if (sigismember(&g->sigraised, sig)) {
                                     if (ev->ev_args.SIGS.sig != NULL)
                                         *(ev->ev_args.SIGS.sig) = sig;
                                     pth_debug2("pth_sched_eventmanager: "
                                                "[signal] event occurred for thread \"%s\"", t->name);
-                                    sigdelset(&pth_sigraised, sig);
+                                    sigdelset(&g->sigraised, sig);
                                     ev->ev_status = PTH_STATUS_OCCURRED;
                                 }
                             }
@@ -810,7 +849,7 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
 
         /* walk to next thread in waiting queue */
         tlast = t;
-        t = pth_pqueue_walk(&pth_WQ, t, PTH_WALK_NEXT);
+        t = pth_pqueue_walk(&g->WQ, t, PTH_WALK_NEXT);
 
         /*
          * move last thread to ready queue if any events occurred for it.
@@ -821,9 +860,9 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
          * a chance.
          */
         if (any_occurred) {
-            pth_pqueue_delete(&pth_WQ, tlast);
+            pth_pqueue_delete(&g->WQ, tlast);
             tlast->state = PTH_STATE_READY;
-            pth_pqueue_insert(&pth_RQ, tlast->prio+1, tlast);
+            pth_pqueue_insert(&g->RQ, tlast->prio+1, tlast);
             pth_debug2("pth_sched_eventmanager: thread \"%s\" moved from waiting "
                        "to ready queue", tlast->name);
         }
@@ -841,14 +880,15 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
 
 intern void pth_sched_eventmanager_sighandler(int sig)
 {
+    pth_gsched_t *g = pth_gsched_active;
     char c;
 
     /* remember raised signal */
-    sigaddset(&pth_sigraised, sig);
+    sigaddset(&g->sigraised, sig);
 
     /* write signal to signal pipe in order to awake the select() */
     c = (int)sig;
-    pth_sc(write)(pth_sigpipe[1], &c, sizeof(char));
+    pth_sc(write)(g->sigpipe[1], &c, sizeof(char));
     return;
 }
 

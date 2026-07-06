@@ -244,6 +244,9 @@ pth_t pth_spawn(pth_attr_t attr, void *(*func)(void *), void *arg)
     if ((t = pth_tcb_alloc(stacksize, stackaddr)) == NULL)
         return pth_error((pth_t)NULL, errno);
 
+    /* bind the thread to the spawning scheduler (its home for its lifetime) */
+    t->sched_home = pth_gsched_active;
+
     /* configure remaining attributes */
     if (attr != PTH_ATTR_DEFAULT) {
         /* overtake fields from the attribute structure */

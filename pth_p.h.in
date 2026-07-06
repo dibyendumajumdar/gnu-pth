@@ -58,6 +58,9 @@
 #include "pth_acdef.h"
 #include "pth_acmac.h"
 
+/* atomic operations, spinlocks and TLS (MP support; no-ops when !PTH_MP) */
+#include "pth_atomic.h"
+
 /* optional system headers */
 #ifdef HAVE_SYS_RESOURCE_H
 #include <sys/resource.h>
