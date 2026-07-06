@@ -443,3 +443,28 @@ mutex fairness mode; `pthread.c` emulation layer mapping to `pth_spawn_on` round
    real syscall (check `pth_gsched_self() == NULL`).
 5. **`select()` fd limits per scheduler** — unchanged from stock Pth, but now
    per-scheduler, which actually relieves pressure.
+
+---
+
+## 10. Implementation notes (phases 0-3 are complete)
+
+Two findings from phase 3 that amend the design above:
+
+**rwlock rewritten natively (§3.5 superseded).** The classic composition
+(first reader acquires `rw_mutex_rw`, last reader releases it) violates the
+mutex ownership check as soon as readers truly overlap — a latent bug that
+single-scheduler cooperative scheduling masked and real parallelism exposes
+immediately. `pth_rwlock_t` now has its own spinlock, reader count, writer
+owner and separate reader/writer wait queues (writer preference), parking
+threads on a new never-polled `PTH_EVENT_NOTIFY` event type.
+
+**Shutdown must not freeze scheduler 0.** `pth_mp_shutdown()` cannot simply
+`pthread_join(3)` the auxiliary schedulers: threads on scheduler 0 may be
+part of the wakeup chains (barrier mutex handoffs) that the auxiliaries'
+threads still need to finish, and `pthread_join` would freeze scheduler 0's
+event loop — a circular wait. It instead naps cooperatively until each
+auxiliary announces its exit through an atomic counter, then reaps the OS
+threads. Relatedly, the auxiliary dry-exit check must run at *both* points
+where the scheduler can block waiting for work (the empty-run-queue idle
+branch and the loop-bottom wait), because the STOP wakeup byte is consumed
+once, and blocking afterwards would sleep forever.

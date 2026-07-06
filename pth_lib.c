@@ -78,6 +78,11 @@ int pth_init(void)
         return pth_error(FALSE, EAGAIN);
     }
 
+    /* register the primary scheduler (MP support) */
+    pth_gsched_pri.id = 0;
+    pth_gsched_tab[0] = &pth_gsched_pri;
+    pth_atomic_store(&pth_gsched_ntab, 1);
+
 #ifdef PTH_EX
     /* optional support for exceptional handling */
     __ex_ctx       = pth_ex_ctx;
@@ -221,7 +226,7 @@ static void pth_spawn_trampoline(void)
     /* NOTREACHED */
     abort();
 }
-pth_t pth_spawn(pth_attr_t attr, void *(*func)(void *), void *arg)
+static pth_t pth_spawn_common(pth_attr_t attr, void *(*func)(void *), void *arg)
 {
     pth_t t;
     unsigned int stacksize;
@@ -243,9 +248,6 @@ pth_t pth_spawn(pth_attr_t attr, void *(*func)(void *), void *arg)
     stackaddr = (attr == PTH_ATTR_DEFAULT ? NULL    : attr->a_stackaddr);
     if ((t = pth_tcb_alloc(stacksize, stackaddr)) == NULL)
         return pth_error((pth_t)NULL, errno);
-
-    /* bind the thread to the spawning scheduler (its home for its lifetime) */
-    t->sched_home = pth_gsched_active;
 
     /* configure remaining attributes */
     if (attr != PTH_ATTR_DEFAULT) {
@@ -321,17 +323,55 @@ pth_t pth_spawn(pth_attr_t attr, void *(*func)(void *), void *arg)
         }
     }
 
-    /* finally insert it into the "new queue" where
-       the scheduler will pick it up for dispatching */
-    if (func != pth_scheduler) {
-        t->state = PTH_STATE_NEW;
-        pth_pqueue_insert(&pth_NQ, t->prio, t);
-    }
-
     pth_debug1("pth_spawn: leave");
 
     /* the returned thread id is just the pointer
        to the thread control block... */
+    return t;
+}
+
+pth_t pth_spawn(pth_attr_t attr, void *(*func)(void *), void *arg)
+{
+    pth_t t;
+
+    if ((t = pth_spawn_common(attr, func, arg)) == NULL)
+        return NULL;
+
+    /* bind the thread to the spawning scheduler (its home for its lifetime)
+       and insert it into the "new queue" where the scheduler will pick it
+       up for dispatching */
+    t->sched_home = pth_gsched_active;
+    if (func != pth_scheduler) {
+        t->state = PTH_STATE_NEW;
+        pth_pqueue_insert(&pth_NQ, t->prio, t);
+    }
+    return t;
+}
+
+/* spawn a thread onto an explicitly chosen scheduler */
+pth_t pth_spawn_on(int sid, pth_attr_t attr, void *(*func)(void *), void *arg)
+{
+    pth_gsched_t *g;
+    pth_t t;
+
+    if (sid < 0 || sid >= pth_atomic_load(&pth_gsched_ntab))
+        return pth_error((pth_t)NULL, EINVAL);
+    g = pth_gsched_tab[sid];
+    if (g == pth_gsched_active)
+        return pth_spawn(attr, func, arg);
+    if (func == NULL)
+        return pth_error((pth_t)NULL, EINVAL);
+    if ((t = pth_spawn_common(attr, func, arg)) == NULL)
+        return NULL;
+
+    /* bind the thread to the target scheduler and hand it over through
+       the target's inbox (only the home scheduler touches its queues) */
+    t->sched_home = g;
+    t->state = PTH_STATE_NEW;
+    if (!pth_gsched_post(g, PTH_GMSG_SPAWN, t, NULL)) {
+        pth_tcb_free(t);
+        return pth_error((pth_t)NULL, ENOMEM);
+    }
     return t;
 }
 
@@ -348,6 +388,8 @@ int pth_raise(pth_t t, int sig)
 
     if (t == NULL || t == pth_current || (sig < 0 || sig > PTH_NSIG))
         return pth_error(FALSE, EINVAL);
+    if (t->sched_home != pth_gsched_active)
+        return pth_error(FALSE, EPERM); /* no cross-scheduler raise */
     if (sig == 0)
         /* just test whether thread exists */
         return pth_thread_exists(t);
@@ -478,6 +520,8 @@ int pth_join(pth_t tid, void **value)
         return pth_error(FALSE, EDEADLK);
     if (tid != NULL && !tid->joinable)
         return pth_error(FALSE, EINVAL);
+    if (tid != NULL && tid->sched_home != pth_gsched_active)
+        return pth_error(FALSE, EINVAL); /* no cross-scheduler join (yet) */
     if (pth_ctrl(PTH_CTRL_GETTHREADS) == 1)
         return pth_error(FALSE, EDEADLK);
     if (tid == NULL)
@@ -506,6 +550,8 @@ int pth_yield(pth_t to)
 
     /* a given thread has to be new or ready or we ignore the request */
     if (to != NULL) {
+        if (to->sched_home != pth_gsched_active)
+            return pth_error(FALSE, EINVAL); /* no cross-scheduler yield */
         switch (to->state) {
             case PTH_STATE_NEW:    q = &pth_NQ; break;
             case PTH_STATE_READY:  q = &pth_RQ; break;
@@ -541,6 +587,8 @@ int pth_suspend(pth_t t)
         return pth_error(FALSE, EINVAL);
     if (t == pth_sched || t == pth_current)
         return pth_error(FALSE, EPERM);
+    if (t->sched_home != pth_gsched_active)
+        return pth_error(FALSE, EPERM); /* no cross-scheduler suspend */
     switch (t->state) {
         case PTH_STATE_NEW:     q = &pth_NQ; break;
         case PTH_STATE_READY:   q = &pth_RQ; break;
@@ -566,6 +614,8 @@ int pth_resume(pth_t t)
         return pth_error(FALSE, EINVAL);
     if (t == pth_sched || t == pth_current)
         return pth_error(FALSE, EPERM);
+    if (t->sched_home != pth_gsched_active)
+        return pth_error(FALSE, EPERM); /* no cross-scheduler resume */
     if (!pth_pqueue_contains(&pth_SQ, t))
         return pth_error(FALSE, EPERM);
     pth_pqueue_delete(&pth_SQ, t);

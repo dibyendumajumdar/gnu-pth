@@ -66,6 +66,10 @@ int pth_cancel(pth_t thread)
     if (thread->state == PTH_STATE_DEAD)
         return pth_error(FALSE, EPERM);
 
+    /* no cross-scheduler cancellation (yet) */
+    if (thread->sched_home != pth_gsched_active)
+        return pth_error(FALSE, EPERM);
+
     /* now mark the thread as cancelled */
     thread->cancelreq = TRUE;
 

@@ -256,78 +256,179 @@ intern void pth_mutex_releaseall(pth_t thread)
 **  Read-Write Locks
 */
 
+/*
+ * NOTE: the classic Pth read-write lock was composed from two mutexes,
+ * with the first arriving reader acquiring the writer-excluding mutex
+ * and the last leaving reader releasing it. That only works while
+ * readers never truly overlap on release (the mutex owner check fails
+ * otherwise), which multiple schedulers immediately violate. It is now
+ * implemented natively: a spinlock-guarded state word plus separate
+ * reader/writer wait queues with directed wakeups (writer preference).
+ */
+
 int pth_rwlock_init(pth_rwlock_t *rwlock)
 {
     if (rwlock == NULL)
         return pth_error(FALSE, EINVAL);
-    rwlock->rw_state = PTH_RWLOCK_INITIALIZED;
+    rwlock->rw_state   = PTH_RWLOCK_INITIALIZED;
+    rwlock->rw_mode    = PTH_RWLOCK_RD;
     rwlock->rw_readers = 0;
-    pth_mutex_init(&(rwlock->rw_mutex_rd));
-    pth_mutex_init(&(rwlock->rw_mutex_rw));
+    rwlock->rw_owner   = NULL;
+    pth_spin_init(&rwlock->rw_lock);
+    pth_waitq_init(&rwlock->rw_waitq_rd);
+    pth_waitq_init(&rwlock->rw_waitq_rw);
+    rwlock->rw_wrwait  = 0;
     return TRUE;
+}
+
+/* dequeue us from the wait queues if we get cancelled inside pth_wait(3) */
+static void pth_rwlock_wait_cleanup(void *arg)
+{
+    pth_rwlock_t *rwlock = (pth_rwlock_t *)arg;
+
+    pth_spin_lock(&rwlock->rw_lock);
+    if (pth_waitq_remove(&rwlock->rw_waitq_rw, pth_current))
+        rwlock->rw_wrwait--;
+    pth_waitq_remove(&rwlock->rw_waitq_rd, pth_current);
+    pth_spin_unlock(&rwlock->rw_lock);
+    return;
 }
 
 int pth_rwlock_acquire(pth_rwlock_t *rwlock, int op, int tryonly, pth_event_t ev_extra)
 {
+    static pth_key_t ev_key_rd = PTH_KEY_INIT;
+    static pth_key_t ev_key_rw = PTH_KEY_INIT;
+    pth_event_t ev;
+
     /* consistency checks */
     if (rwlock == NULL)
         return pth_error(FALSE, EINVAL);
     if (!(rwlock->rw_state & PTH_RWLOCK_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
 
-    /* acquire lock */
-    if (op == PTH_RWLOCK_RW) {
-        /* read-write lock is simple */
-        if (!pth_mutex_acquire(&(rwlock->rw_mutex_rw), tryonly, ev_extra))
-            return FALSE;
-        rwlock->rw_mode = PTH_RWLOCK_RW;
-    }
-    else {
-        /* read-only lock is more complicated to get right */
-        if (!pth_mutex_acquire(&(rwlock->rw_mutex_rd), tryonly, ev_extra))
-            return FALSE;
-        rwlock->rw_readers++;
-        if (rwlock->rw_readers == 1) {
-            if (!pth_mutex_acquire(&(rwlock->rw_mutex_rw), tryonly, ev_extra)) {
-                rwlock->rw_readers--;
-                pth_shield { pth_mutex_release(&(rwlock->rw_mutex_rd)); }
-                return FALSE;
+    pth_spin_lock(&rwlock->rw_lock);
+    for (;;) {
+        if (op == PTH_RWLOCK_RW) {
+            /* writers need the lock exclusively */
+            if (rwlock->rw_owner == NULL && rwlock->rw_readers == 0) {
+                rwlock->rw_owner = pth_current;
+                rwlock->rw_mode  = PTH_RWLOCK_RW;
+                pth_spin_unlock(&rwlock->rw_lock);
+                return TRUE;
             }
         }
-        rwlock->rw_mode = PTH_RWLOCK_RD;
-        pth_mutex_release(&(rwlock->rw_mutex_rd));
+        else {
+            /* readers pass unless a writer is active or waiting
+               (writer preference avoids writer starvation) */
+            if (rwlock->rw_owner == NULL && rwlock->rw_wrwait == 0) {
+                rwlock->rw_readers++;
+                rwlock->rw_mode = PTH_RWLOCK_RD;
+                pth_spin_unlock(&rwlock->rw_lock);
+                return TRUE;
+            }
+        }
+
+        /* should we just tryonly? */
+        if (tryonly) {
+            pth_spin_unlock(&rwlock->rw_lock);
+            return pth_error(FALSE, EBUSY);
+        }
+
+        /* park on the respective wait queue (spinlock still held) */
+        if (op == PTH_RWLOCK_RW) {
+            ev = pth_event(PTH_EVENT_NOTIFY|PTH_MODE_STATIC, &ev_key_rw, (void *)rwlock);
+            if (ev_extra != NULL)
+                pth_event_concat(ev, ev_extra, NULL);
+            pth_current->wq_event = ev;
+            pth_waitq_append(&rwlock->rw_waitq_rw, pth_current);
+            rwlock->rw_wrwait++;
+        }
+        else {
+            ev = pth_event(PTH_EVENT_NOTIFY|PTH_MODE_STATIC, &ev_key_rd, (void *)rwlock);
+            if (ev_extra != NULL)
+                pth_event_concat(ev, ev_extra, NULL);
+            pth_current->wq_event = ev;
+            pth_waitq_append(&rwlock->rw_waitq_rd, pth_current);
+        }
+        pth_spin_unlock(&rwlock->rw_lock);
+
+        pth_cleanup_push(pth_rwlock_wait_cleanup, rwlock);
+        pth_wait(ev);
+        pth_cleanup_pop(FALSE);
+
+        pth_spin_lock(&rwlock->rw_lock);
+        /* no-ops if a releaser already dequeued us */
+        if (op == PTH_RWLOCK_RW) {
+            if (pth_waitq_remove(&rwlock->rw_waitq_rw, pth_current))
+                rwlock->rw_wrwait--;
+        }
+        else
+            pth_waitq_remove(&rwlock->rw_waitq_rd, pth_current);
+        if (ev_extra != NULL) {
+            pth_event_isolate(ev);
+            if (pth_event_status(ev) == PTH_STATUS_PENDING) {
+                pth_spin_unlock(&rwlock->rw_lock);
+                return pth_error(FALSE, EINTR);
+            }
+        }
+        /* loop and re-check (someone may have barged in) */
     }
-    return TRUE;
 }
 
 int pth_rwlock_release(pth_rwlock_t *rwlock)
 {
+    pth_t w;
+    pth_t chain;
+
     /* consistency checks */
     if (rwlock == NULL)
         return pth_error(FALSE, EINVAL);
     if (!(rwlock->rw_state & PTH_RWLOCK_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
 
-    /* release lock */
-    if (rwlock->rw_mode == PTH_RWLOCK_RW) {
-        /* read-write unlock is simple */
-        if (!pth_mutex_release(&(rwlock->rw_mutex_rw)))
-            return FALSE;
+    pth_spin_lock(&rwlock->rw_lock);
+    if (rwlock->rw_owner != NULL) {
+        /* write lock held: only the owner may release it */
+        if (rwlock->rw_owner != pth_current) {
+            pth_spin_unlock(&rwlock->rw_lock);
+            return pth_error(FALSE, EACCES);
+        }
+        rwlock->rw_owner = NULL;
     }
     else {
-        /* read-only unlock is more complicated to get right */
-        if (!pth_mutex_acquire(&(rwlock->rw_mutex_rd), FALSE, NULL))
-            return FALSE;
-        rwlock->rw_readers--;
+        /* read lock held */
         if (rwlock->rw_readers == 0) {
-            if (!pth_mutex_release(&(rwlock->rw_mutex_rw))) {
-                rwlock->rw_readers++;
-                pth_shield { pth_mutex_release(&(rwlock->rw_mutex_rd)); }
-                return FALSE;
-            }
+            pth_spin_unlock(&rwlock->rw_lock);
+            return pth_error(FALSE, EPERM);
         }
-        rwlock->rw_mode = PTH_RWLOCK_RD;
-        pth_mutex_release(&(rwlock->rw_mutex_rd));
+        rwlock->rw_readers--;
+        if (rwlock->rw_readers > 0) {
+            pth_spin_unlock(&rwlock->rw_lock);
+            return TRUE;
+        }
+    }
+
+    /* the lock became free: wake a parked writer if any,
+       else release the whole herd of parked readers */
+    w = pth_waitq_shift(&rwlock->rw_waitq_rw);
+    if (w != NULL) {
+        rwlock->rw_wrwait--;
+        pth_spin_unlock(&rwlock->rw_lock);
+        pth_gsched_wake(w->sched_home, w, w->wq_event);
+    }
+    else {
+        chain = NULL;
+        while ((w = pth_waitq_shift(&rwlock->rw_waitq_rd)) != NULL) {
+            w->wq_next = chain;
+            chain = w;
+        }
+        pth_spin_unlock(&rwlock->rw_lock);
+        while (chain != NULL) {
+            w = chain;
+            chain = w->wq_next;
+            w->wq_next = NULL;
+            pth_gsched_wake(w->sched_home, w, w->wq_event);
+        }
     }
     return TRUE;
 }

@@ -187,6 +187,7 @@ struct pth_event_st;
 #define PTH_EVENT_COND               _BIT(7)
 #define PTH_EVENT_TID                _BIT(8)
 #define PTH_EVENT_FUNC               _BIT(9)
+#define PTH_EVENT_NOTIFY             _BIT(10) /* internal: explicit wakeup only */
 
     /* event occurange restrictions */
 #define PTH_UNTIL_OCCURRED           _BIT(11)
@@ -255,7 +256,7 @@ struct pth_ring_st {
 enum { PTH_RWLOCK_RD, PTH_RWLOCK_RW };
 #define PTH_RWLOCK_INITIALIZED       _BIT(0)
 #define PTH_RWLOCK_INIT              { PTH_RWLOCK_INITIALIZED, PTH_RWLOCK_RD, 0, \
-                                       PTH_MUTEX_INIT, PTH_MUTEX_INIT }
+                                       NULL, 0, {NULL, NULL}, {NULL, NULL}, 0 }
 
    /* condition variable values */
 #define PTH_COND_INITIALIZED         _BIT(0)
@@ -308,9 +309,12 @@ typedef struct pth_rwlock_st pth_rwlock_t;
 struct pth_rwlock_st { /* not hidden to avoid destructor */
     int            rw_state;
     unsigned int   rw_mode;
-    unsigned long  rw_readers;
-    pth_mutex_t    rw_mutex_rd;
-    pth_mutex_t    rw_mutex_rw;
+    unsigned long  rw_readers;   /* number of active readers            */
+    pth_t          rw_owner;     /* active writer (NULL if none)        */
+    volatile int   rw_lock;      /* internal spinlock (multi-scheduler) */
+    pth_waitq_t    rw_waitq_rd;  /* FIFO of parked readers              */
+    pth_waitq_t    rw_waitq_rw;  /* FIFO of parked writers              */
+    unsigned long  rw_wrwait;    /* number of parked writers            */
 };
 
     /* the condition variable structure */
@@ -444,6 +448,11 @@ extern int            pth_attr_destroy(pth_attr_t);
 
     /* thread functions */
 extern pth_t          pth_spawn(pth_attr_t, void *(*)(void *), void *);
+extern pth_t          pth_spawn_on(int, pth_attr_t, void *(*)(void *), void *);
+extern int            pth_mp_init(int);
+extern int            pth_mp_shutdown(void);
+extern int            pth_sched_count(void);
+extern int            pth_sched_id(void);
 extern int            pth_once(pth_once_t *, void (*)(void *), void *);
 extern pth_t          pth_self(void);
 extern int            pth_suspend(pth_t);

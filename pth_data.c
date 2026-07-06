@@ -33,18 +33,22 @@ struct pth_keytab_st {
 };
 
 static struct pth_keytab_st pth_keytab[PTH_KEY_MAX];
+static volatile int pth_keytab_lock = PTH_SPIN_INIT;
 
 int pth_key_create(pth_key_t *key, void (*func)(void *))
 {
     if (key == NULL)
         return pth_error(FALSE, EINVAL);
+    pth_spin_lock(&pth_keytab_lock);
     for ((*key) = 0; (*key) < PTH_KEY_MAX; (*key)++) {
         if (pth_keytab[(*key)].used == FALSE) {
             pth_keytab[(*key)].used = TRUE;
             pth_keytab[(*key)].destructor = func;
+            pth_spin_unlock(&pth_keytab_lock);
             return TRUE;
         }
     }
+    pth_spin_unlock(&pth_keytab_lock);
     return pth_error(FALSE, EAGAIN);
 }
 
@@ -52,9 +56,13 @@ int pth_key_delete(pth_key_t key)
 {
     if (key < 0 || key >= PTH_KEY_MAX)
         return pth_error(FALSE, EINVAL);
-    if (!pth_keytab[key].used)
+    pth_spin_lock(&pth_keytab_lock);
+    if (!pth_keytab[key].used) {
+        pth_spin_unlock(&pth_keytab_lock);
         return pth_error(FALSE, ENOENT);
+    }
     pth_keytab[key].used = FALSE;
+    pth_spin_unlock(&pth_keytab_lock);
     return TRUE;
 }
 

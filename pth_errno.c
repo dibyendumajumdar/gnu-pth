@@ -49,8 +49,13 @@
         (errno = (errno_val), (return_val))
 #endif
 
+/* errno storage for the shield (thread-local in MP builds; declared
+   manually because scpp cannot parse the PTH_TLS storage class) */
+extern PTH_TLS int pth_errno_storage;
+extern PTH_TLS int pth_errno_flag;
+
 #endif /* cpp */
 
-intern int pth_errno_storage = 0;
-intern int pth_errno_flag    = 0;
+PTH_TLS int pth_errno_storage = 0;
+PTH_TLS int pth_errno_flag    = 0;
 

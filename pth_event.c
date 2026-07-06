@@ -51,6 +51,7 @@ struct pth_event_st {
         struct { pth_cond_t *cond; }                                COND;
         struct { pth_t tid; }                                       TID;
         struct { pth_event_func_t func; void *arg; pth_time_t tv; } FUNC;
+        struct { void *go; }                                        NOTIFY;
     } ev_args;
 };
 
@@ -177,6 +178,14 @@ pth_event_t pth_event(unsigned long spec, ...)
         ev->ev_type = PTH_EVENT_COND;
         ev->ev_goal = (int)(spec & (PTH_UNTIL_OCCURRED));
         ev->ev_args.COND.cond = cond;
+    }
+    else if (spec & PTH_EVENT_NOTIFY) {
+        /* explicit notification only (never polled; used internally by
+           synchronization objects with their own wait queues) */
+        void *go = va_arg(ap, void *);
+        ev->ev_type = PTH_EVENT_NOTIFY;
+        ev->ev_goal = (int)(spec & (PTH_UNTIL_OCCURRED));
+        ev->ev_args.NOTIFY.go = go;
     }
     else if (spec & PTH_EVENT_TID) {
         /* thread id event */

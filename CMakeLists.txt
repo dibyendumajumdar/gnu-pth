@@ -34,6 +34,10 @@ set(PTH_MCTX_STK "" CACHE STRING "Force mctx stack setup (mc, ss, sas, none)")
 if(PTH_BUILD_PTHREAD)
     set(PTH_SYSCALL_SOFT ON)  # configure.ac forces this for --enable-pthread
 endif()
+if(PTH_MP AND PTH_BUILD_PTHREAD)
+    message(FATAL_ERROR "PTH_MP uses the system pthread library internally and "
+                        "cannot be combined with the pthread emulation library")
+endif()
 
 include(CheckIncludeFile)
 include(CheckFunctionExists)
@@ -460,6 +464,12 @@ if(PTH_BUILD_TESTS)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()
+    if(PTH_MP)
+        add_executable(test_mpsched test_mpsched.c test_common.c)
+        target_link_libraries(test_mpsched PRIVATE pth)
+        add_test(NAME test_mpsched COMMAND test_mpsched)
+        set_tests_properties(test_mpsched PROPERTIES TIMEOUT 120)
+    endif()
 endif()
 
 # -- install --------------------------------------------------------------------

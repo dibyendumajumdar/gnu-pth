@@ -27,6 +27,10 @@
                                      -- Unknown   */
 #include "pth_p.h"
 
+#ifdef PTH_MP
+#include <pthread.h>
+#endif
+
 #if cpp
 
 /*
@@ -55,7 +59,23 @@ struct pth_gsched_st {
     pth_time_t   loadticknext; /* next time point for load calculation  */
     pth_time_t   loadtickgap;  /* interval between load calculations    */
     void * volatile inbox;     /* wakeup inbox: MPSC stack of pth_gmsg_t */
+    /* MP control (auxiliary schedulers only) */
+    int          stop;         /* shutdown was requested (PTH_GMSG_STOP) */
+    pth_mctx_t   bootmctx;     /* OS thread context to return to on stop */
+    unsigned long osthread;    /* pthread_t of the scheduler's OS thread */
+    pth_atomic_t boot_done;    /* bootstrap finished flag                */
+    int          boot_rc;      /* bootstrap result                       */
 };
+
+#define PTH_GSCHED_MAX 64      /* maximum number of schedulers */
+
+/* registry of all schedulers (struct-wrapped so scpp can export it) */
+typedef struct { pth_gsched_t *tab[PTH_GSCHED_MAX]; } pth_gsched_tabreg_t;
+#define pth_gsched_tab (pth_gsched_tabreg.tab)
+
+/* the active scheduler of the calling OS thread (thread-local in MP builds;
+   declared manually because scpp cannot parse the PTH_TLS storage class) */
+extern PTH_TLS pth_gsched_t *pth_gsched_active;
 
 /*
  * Single-scheduler source compatibility: the classic global names resolve
@@ -87,11 +107,16 @@ struct pth_gmsg_st {
 };
 #define PTH_GMSG_WAKE  1
 #define PTH_GMSG_SPAWN 2
+#define PTH_GMSG_STOP  3
 
 #endif /* cpp */
 
 intern pth_gsched_t  pth_gsched_pri;                      /* the primary scheduler            */
-intern pth_gsched_t *pth_gsched_active = &pth_gsched_pri; /* scheduler of this OS thread      */
+PTH_TLS pth_gsched_t *pth_gsched_active = &pth_gsched_pri;/* scheduler of this OS thread      */
+
+intern pth_gsched_tabreg_t pth_gsched_tabreg = { { NULL } }; /* registry of all schedulers */
+intern pth_atomic_t  pth_gsched_ntab = PTH_ATOMIC_INIT(1);/* number of schedulers             */
+intern pth_atomic_t  pth_gsched_nexited = PTH_ATOMIC_INIT(0); /* auxiliaries that have exited */
 
 /* initialize the scheduler ingredients */
 intern int pth_scheduler_init(void)
@@ -128,6 +153,9 @@ intern int pth_scheduler_init(void)
 
     /* initialize the wakeup inbox */
     g->inbox = NULL;
+
+    /* initialize MP control state */
+    g->stop = FALSE;
 
     return TRUE;
 }
@@ -187,14 +215,14 @@ intern void pth_scheduler_kill(void)
  * is pushed BEFORE the pipe byte is written; the event manager clears
  * the pipe BEFORE draining, so no wakeup can be lost.
  */
-intern int pth_gsched_wake(pth_gsched_t *g, pth_t t, pth_event_t ev)
+intern int pth_gsched_post(pth_gsched_t *g, int kind, pth_t t, pth_event_t ev)
 {
     pth_gmsg_t *m;
     void *head;
 
     if ((m = (pth_gmsg_t *)malloc(sizeof(pth_gmsg_t))) == NULL)
         return FALSE;
-    m->kind   = PTH_GMSG_WAKE;
+    m->kind   = kind;
     m->thread = t;
     m->event  = ev;
     do {
@@ -204,6 +232,11 @@ intern int pth_gsched_wake(pth_gsched_t *g, pth_t t, pth_event_t ev)
     if (g != pth_gsched_active)
         pth_sc(write)(g->sigpipe[1], "!", 1);
     return TRUE;
+}
+
+intern int pth_gsched_wake(pth_gsched_t *g, pth_t t, pth_event_t ev)
+{
+    return pth_gsched_post(g, PTH_GMSG_WAKE, t, ev);
 }
 
 /*
@@ -238,8 +271,19 @@ intern int pth_gsched_drain(pth_gsched_t *g)
         }
         else if (rev->kind == PTH_GMSG_SPAWN) {
             /* adopt a remotely spawned thread into our new queue */
+#if PTH_MCTX_MTH(mcsc)
+            /* the machine context was created on the spawner's OS thread
+               and carries its signal mask; auxiliary schedulers run with
+               all signals blocked (signals are scheduler 0 business) */
+            if (g->id != 0)
+                sigfillset(&rev->thread->mctx.uc.uc_sigmask);
+#endif
             rev->thread->state = PTH_STATE_NEW;
             pth_pqueue_insert(&g->NQ, rev->thread->prio, rev->thread);
+        }
+        else if (rev->kind == PTH_GMSG_STOP) {
+            /* shut down as soon as we have run dry */
+            g->stop = TRUE;
         }
         free(rev);
         any = TRUE;
@@ -332,6 +376,21 @@ intern void *pth_scheduler(void *dummy)
          */
         g->current = pth_pqueue_delmax(&g->RQ);
         if (g->current == NULL) {
+#ifdef PTH_MP
+            if (g->id != 0) {
+                /* an auxiliary scheduler may legitimately run dry: shut
+                   down if requested and fully drained, else wait for new
+                   work to arrive through the wakeup inbox */
+                if (   g->stop
+                    && pth_pqueue_elements(&g->NQ) == 0
+                    && pth_pqueue_elements(&g->WQ) == 0
+                    && pth_pqueue_elements(&g->SQ) == 0)
+                    pth_mctx_switch(&g->sched->mctx, &g->bootmctx);
+                pth_time_set(&snapshot, PTH_TIME_NOW);
+                pth_sched_eventmanager(&snapshot, FALSE /* wait */);
+                continue;
+            }
+#endif
             fprintf(stderr, "**Pth** SCHEDULER INTERNAL ERROR: "
                             "no more thread(s) available to schedule!?!?\n");
             abort();
@@ -490,9 +549,21 @@ intern void *pth_scheduler(void *dummy)
          * we have already no new or ready threads.
          */
         if (   pth_pqueue_elements(&g->RQ) == 0
-            && pth_pqueue_elements(&g->NQ) == 0)
+            && pth_pqueue_elements(&g->NQ) == 0) {
+#ifdef PTH_MP
+            /* before an auxiliary scheduler blocks waiting for new work:
+               if shutdown was requested and it has fully run dry, leave
+               (the STOP wakeup byte was already consumed, so blocking in
+               select(2) here would sleep forever) */
+            if (   g->id != 0
+                && g->stop
+                && pth_pqueue_elements(&g->WQ) == 0
+                && pth_pqueue_elements(&g->SQ) == 0)
+                pth_mctx_switch(&g->sched->mctx, &g->bootmctx);
+#endif
             /* still no NEW or READY threads, so we have to wait for new work */
             pth_sched_eventmanager(&snapshot, FALSE /* wait */);
+        }
         else
             /* already NEW or READY threads exists, so just poll for even more work */
             pth_sched_eventmanager(&snapshot, TRUE  /* poll */);
@@ -723,20 +794,24 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     if (fdmax < g->sigpipe[0])
         fdmax = g->sigpipe[0];
 
-    /* replace signal actions for signals we've to catch for events */
-    for (sig = 1; sig < PTH_NSIG; sig++) {
-        if (sigismember(&g->sigcatch, sig)) {
-            sa.sa_handler = pth_sched_eventmanager_sighandler;
-            sigfillset(&sa.sa_mask);
-            sa.sa_flags = 0;
-            sigaction(sig, &sa, &osa[sig]);
+    /* replace signal actions for signals we've to catch for events
+       (signal handling is the business of scheduler 0 only; auxiliary
+       schedulers keep all signals permanently blocked) */
+    if (g->id == 0) {
+        for (sig = 1; sig < PTH_NSIG; sig++) {
+            if (sigismember(&g->sigcatch, sig)) {
+                sa.sa_handler = pth_sched_eventmanager_sighandler;
+                sigfillset(&sa.sa_mask);
+                sa.sa_flags = 0;
+                sigaction(sig, &sa, &osa[sig]);
+            }
         }
-    }
 
-    /* allow some signals to be delivered: Either to our
-       catching handler or directly to the configured
-       handler for signals not catched by events */
-    pth_sc(sigprocmask)(SIG_SETMASK, &g->sigblock, &oss);
+        /* allow some signals to be delivered: Either to our
+           catching handler or directly to the configured
+           handler for signals not catched by events */
+        pth_sc(sigprocmask)(SIG_SETMASK, &g->sigblock, &oss);
+    }
 
     /* now do the polling for filedescriptor I/O and timers
        WHEN THE SCHEDULER SLEEPS AT ALL, THEN HERE!! */
@@ -746,10 +821,12 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
                && errno == EINTR) ;
 
     /* restore signal mask and actions and handle signals */
-    pth_sc(sigprocmask)(SIG_SETMASK, &oss, NULL);
-    for (sig = 1; sig < PTH_NSIG; sig++)
-        if (sigismember(&g->sigcatch, sig))
-            sigaction(sig, &osa[sig], NULL);
+    if (g->id == 0) {
+        pth_sc(sigprocmask)(SIG_SETMASK, &oss, NULL);
+        for (sig = 1; sig < PTH_NSIG; sig++)
+            if (sigismember(&g->sigcatch, sig))
+                sigaction(sig, &osa[sig], NULL);
+    }
 
     /* drain the wakeup inbox again: messages which arrived while we
        were sleeping in select(2) must be applied before the cleanup
@@ -967,3 +1044,153 @@ intern void pth_sched_eventmanager_sighandler(int sig)
     return;
 }
 
+
+
+/*
+** ____ MULTI-SCHEDULER RUNTIME (MP) _________________________________
+*/
+
+#ifdef PTH_MP
+/* bootstrap function running on each auxiliary scheduler's OS thread */
+static void *pth_gsched_bootstrap(void *arg)
+{
+    pth_gsched_t *g = (pth_gsched_t *)arg;
+    pth_attr_t t_attr;
+    sigset_t ss;
+
+    /* route all Pth operations on this OS thread to our scheduler */
+    pth_gsched_active = g;
+
+    /* signals are the business of scheduler 0 only */
+    sigfillset(&ss);
+    pthread_sigmask(SIG_SETMASK, &ss, NULL);
+
+    /* per-scheduler state (queues, signal pipe, inbox) */
+    if (!pth_scheduler_init()) {
+        g->boot_rc = FALSE;
+        pth_atomic_store(&g->boot_done, 1);
+        return NULL;
+    }
+
+    /* spawn the scheduler thread (green stack) */
+    t_attr = pth_attr_new();
+    pth_attr_set(t_attr, PTH_ATTR_PRIO,         PTH_PRIO_MAX);
+    pth_attr_set(t_attr, PTH_ATTR_NAME,         "**SCHEDULER**");
+    pth_attr_set(t_attr, PTH_ATTR_JOINABLE,     FALSE);
+    pth_attr_set(t_attr, PTH_ATTR_CANCEL_STATE, PTH_CANCEL_DISABLE);
+    pth_attr_set(t_attr, PTH_ATTR_STACK_SIZE,   64*1024);
+    pth_attr_set(t_attr, PTH_ATTR_STACK_ADDR,   NULL);
+    g->sched = pth_spawn(t_attr, pth_scheduler, NULL);
+    pth_attr_destroy(t_attr);
+    if (g->sched == NULL) {
+        pth_scheduler_kill();
+        g->boot_rc = FALSE;
+        pth_atomic_store(&g->boot_done, 1);
+        return NULL;
+    }
+
+    /* report success and enter the scheduler; it returns control here
+       only after a PTH_GMSG_STOP once it has fully run dry */
+    g->boot_rc = TRUE;
+    pth_atomic_store(&g->boot_done, 1);
+    g->current = g->sched;
+    pth_mctx_switch(&g->bootmctx, &g->sched->mctx);
+
+    /* shutdown: release the scheduler's resources */
+    pth_tcb_free(g->sched);
+    g->sched = NULL;
+    pth_scheduler_kill();
+    pth_atomic_inc(&pth_gsched_nexited);
+    return NULL;
+}
+#endif /* PTH_MP */
+
+/* start additional schedulers until `nsched' of them exist */
+int pth_mp_init(int nsched)
+{
+    if (nsched < 1 || nsched > PTH_GSCHED_MAX)
+        return pth_error(FALSE, EINVAL);
+
+    /* implicit initialization of the primary scheduler */
+    pth_implicit_init();
+
+    /* may only be used from the primary scheduler */
+    if (pth_gsched_active != &pth_gsched_pri)
+        return pth_error(FALSE, EPERM);
+
+#ifndef PTH_MP
+    if (nsched != 1)
+        return pth_error(FALSE, ENOSYS);
+    return TRUE;
+#else
+    while (pth_atomic_load(&pth_gsched_ntab) < nsched) {
+        pth_gsched_t *g;
+        pthread_t pt;
+        int id = pth_atomic_load(&pth_gsched_ntab);
+
+        if ((g = (pth_gsched_t *)calloc(1, sizeof(pth_gsched_t))) == NULL)
+            return pth_error(FALSE, ENOMEM);
+        g->id = id;
+        pth_atomic_store(&g->boot_done, 0);
+        if (pthread_create(&pt, NULL, pth_gsched_bootstrap, g) != 0) {
+            free(g);
+            return pth_error(FALSE, EAGAIN);
+        }
+        g->osthread = (unsigned long)pt;
+        while (!pth_atomic_load(&g->boot_done))
+            pth_nap(pth_time(0, 1000));
+        if (!g->boot_rc) {
+            free(g);
+            return pth_error(FALSE, EAGAIN);
+        }
+        pth_gsched_tab[id] = g;
+        pth_atomic_inc(&pth_gsched_ntab);
+    }
+    return TRUE;
+#endif
+}
+
+/* stop all auxiliary schedulers (blocks until each has run dry; make sure
+   their threads have terminated, or arrange for them to terminate, first) */
+int pth_mp_shutdown(void)
+{
+#ifdef PTH_MP
+    int i, n;
+
+    if (!pth_initialized)
+        return pth_error(FALSE, EINVAL);
+    if (pth_gsched_active != &pth_gsched_pri)
+        return pth_error(FALSE, EPERM);
+    n = pth_atomic_load(&pth_gsched_ntab);
+    for (i = 1; i < n; i++)
+        pth_gsched_post(pth_gsched_tab[i], PTH_GMSG_STOP, NULL, NULL);
+    /* IMPORTANT: do not block this OS thread in pthread_join(3) while the
+       auxiliaries are still winding down: our own scheduler must keep
+       running, because threads on it may be part of the wakeup chains
+       (e.g. barrier mutex handoffs) the auxiliaries' threads are waiting
+       on. So nap cooperatively until every auxiliary has announced its
+       exit, and only then reap the (already finished) OS threads. */
+    while (pth_atomic_load(&pth_gsched_nexited) < n - 1)
+        pth_nap(pth_time(0, 1000));
+    for (i = 1; i < n; i++) {
+        pthread_join((pthread_t)pth_gsched_tab[i]->osthread, NULL);
+        free(pth_gsched_tab[i]);
+        pth_gsched_tab[i] = NULL;
+    }
+    pth_atomic_store(&pth_gsched_ntab, 1);
+    pth_atomic_store(&pth_gsched_nexited, 0);
+#endif
+    return TRUE;
+}
+
+/* number of running schedulers */
+int pth_sched_count(void)
+{
+    return pth_atomic_load(&pth_gsched_ntab);
+}
+
+/* scheduler identifier of the calling thread */
+int pth_sched_id(void)
+{
+    return pth_gsched_active->id;
+}
