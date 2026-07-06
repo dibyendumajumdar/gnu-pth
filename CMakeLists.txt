@@ -446,7 +446,7 @@ endif()
 if(PTH_BUILD_TESTS)
     enable_testing()
     foreach(t test_std test_mp test_misc test_philo test_sig
-              test_select test_httpd test_uctx)
+              test_select test_httpd test_uctx test_sync)
         add_executable(${t} ${t}.c test_common.c)
         target_link_libraries(${t} PRIVATE pth)
     endforeach()
@@ -456,7 +456,7 @@ if(PTH_BUILD_TESTS)
     endif()
     # Only test_std and test_uctx are self-terminating, non-interactive tests;
     # the others (mp, sig, philo, misc, select, httpd) are interactive demos.
-    foreach(t test_std test_uctx)
+    foreach(t test_std test_uctx test_sync)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()

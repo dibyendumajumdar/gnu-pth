@@ -42,6 +42,10 @@ struct pth_st {
     /* scheduler binding (MP support; a thread never migrates) */
     struct pth_gsched_st *sched_home;    /* home scheduler of this thread               */
 
+    /* wait-queue linkage (parked on a sync primitive; guarded by its spinlock) */
+    pth_t          wq_next;              /* next thread in primitive wait queue         */
+    pth_event_t    wq_event;             /* event to mark occurred upon wakeup          */
+
     /* standard thread control block ingredients */
     int            prio;                 /* base priority of thread                     */
     char           name[PTH_TCB_NAMELEN];/* name of thread (mainly for debugging)       */
@@ -114,6 +118,8 @@ intern pth_t pth_tcb_alloc(unsigned int stacksize, void *stackaddr)
     if ((t = (pth_t)malloc(sizeof(struct pth_st))) == NULL)
         return NULL;
     t->sched_home = NULL;
+    t->wq_next    = NULL;
+    t->wq_event   = NULL;
     t->stacksize  = stacksize;
     t->stack      = NULL;
     t->stackguard = NULL;

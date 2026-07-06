@@ -249,7 +249,7 @@ struct pth_ring_st {
    /* mutex values */
 #define PTH_MUTEX_INITIALIZED        _BIT(0)
 #define PTH_MUTEX_LOCKED             _BIT(1)
-#define PTH_MUTEX_INIT               { {NULL, NULL}, PTH_MUTEX_INITIALIZED, NULL, 0 }
+#define PTH_MUTEX_INIT               { {NULL, NULL}, PTH_MUTEX_INITIALIZED, NULL, 0, 0, {NULL, NULL} }
 
    /* read-write lock values */
 enum { PTH_RWLOCK_RD, PTH_RWLOCK_RW };
@@ -262,7 +262,7 @@ enum { PTH_RWLOCK_RD, PTH_RWLOCK_RW };
 #define PTH_COND_SIGNALED            _BIT(1)
 #define PTH_COND_BROADCAST           _BIT(2)
 #define PTH_COND_HANDLED             _BIT(3)
-#define PTH_COND_INIT                { PTH_COND_INITIALIZED, 0 }
+#define PTH_COND_INIT                { PTH_COND_INITIALIZED, 0, 0, {NULL, NULL} }
 
    /* barrier variable values */
 #define PTH_BARRIER_INITIALIZED      _BIT(0)
@@ -285,6 +285,13 @@ struct pth_message_st { /* not hidden to allow inclusion */
     void          *m_data;
 };
 
+    /* the thread wait-queue structure (internal FIFO of blocked threads) */
+typedef struct pth_waitq_st pth_waitq_t;
+struct pth_waitq_st {
+    pth_t wq_head;
+    pth_t wq_tail;
+};
+
     /* the mutex structure */
 typedef struct pth_mutex_st pth_mutex_t;
 struct pth_mutex_st { /* not hidden to avoid destructor */
@@ -292,6 +299,8 @@ struct pth_mutex_st { /* not hidden to avoid destructor */
     int            mx_state;
     pth_t          mx_owner;
     unsigned long  mx_count;
+    volatile int   mx_lock;      /* internal spinlock (multi-scheduler)  */
+    pth_waitq_t    mx_waitq;     /* FIFO of threads waiting for release  */
 };
 
     /* the read-write lock structure */
@@ -309,6 +318,8 @@ typedef struct pth_cond_st pth_cond_t;
 struct pth_cond_st { /* not hidden to avoid destructor */
     unsigned long cn_state;
     unsigned int  cn_waiters;
+    volatile int  cn_lock;       /* internal spinlock (multi-scheduler)  */
+    pth_waitq_t   cn_waitq;      /* FIFO of waiting threads              */
 };
 
     /* the barrier variable structure */

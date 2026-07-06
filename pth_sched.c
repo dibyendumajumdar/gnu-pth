@@ -54,6 +54,7 @@ struct pth_gsched_st {
     sigset_t     sigraised;    /* mask of raised signals                */
     pth_time_t   loadticknext; /* next time point for load calculation  */
     pth_time_t   loadtickgap;  /* interval between load calculations    */
+    void * volatile inbox;     /* wakeup inbox: MPSC stack of pth_gmsg_t */
 };
 
 /*
@@ -72,6 +73,20 @@ struct pth_gsched_st {
 #define pth_DQ        (pth_gsched_active->DQ)
 #define pth_favournew (pth_gsched_active->favournew)
 #define pth_loadval   (pth_gsched_active->loadval)
+
+/*
+ * Cross-scheduler message, delivered to a scheduler's wakeup inbox.
+ * Allocated by the sender, freed by the draining (home) scheduler.
+ */
+typedef struct pth_gmsg_st pth_gmsg_t;
+struct pth_gmsg_st {
+    struct pth_gmsg_st *next;   /* inbox linkage                          */
+    int                 kind;   /* PTH_GMSG_*                             */
+    pth_t               thread; /* subject thread                         */
+    pth_event_t         event;  /* PTH_GMSG_WAKE: event to mark occurred  */
+};
+#define PTH_GMSG_WAKE  1
+#define PTH_GMSG_SPAWN 2
 
 #endif /* cpp */
 
@@ -110,6 +125,9 @@ intern int pth_scheduler_init(void)
     g->loadval = 1.0;
     pth_time_set(&g->loadtickgap, &gap);
     pth_time_set(&g->loadticknext, PTH_TIME_NOW);
+
+    /* initialize the wakeup inbox */
+    g->inbox = NULL;
 
     return TRUE;
 }
@@ -160,6 +178,76 @@ intern void pth_scheduler_kill(void)
     close(g->sigpipe[1]);
     return;
 }
+/*
+ * Wake a thread parked on a synchronization primitive: deliver a message
+ * to its home scheduler's wakeup inbox. If that scheduler is a foreign
+ * one it may currently be blocked in select(2), so we additionally kick
+ * its signal pipe. Our own scheduler needs no kick because it always
+ * drains the inbox before going to sleep. NOTE the ordering: the message
+ * is pushed BEFORE the pipe byte is written; the event manager clears
+ * the pipe BEFORE draining, so no wakeup can be lost.
+ */
+intern int pth_gsched_wake(pth_gsched_t *g, pth_t t, pth_event_t ev)
+{
+    pth_gmsg_t *m;
+    void *head;
+
+    if ((m = (pth_gmsg_t *)malloc(sizeof(pth_gmsg_t))) == NULL)
+        return FALSE;
+    m->kind   = PTH_GMSG_WAKE;
+    m->thread = t;
+    m->event  = ev;
+    do {
+        head = g->inbox;
+        m->next = (pth_gmsg_t *)head;
+    } while (!pth_atomic_ptr_cas(&g->inbox, head, m));
+    if (g != pth_gsched_active)
+        pth_sc(write)(g->sigpipe[1], "!", 1);
+    return TRUE;
+}
+
+/*
+ * Drain the wakeup inbox: apply all pending messages. Returns TRUE if
+ * any message was processed. Only ever runs in the scheduler's own OS
+ * thread, so all thread/event/queue manipulation stays scheduler-local.
+ */
+intern int pth_gsched_drain(pth_gsched_t *g)
+{
+    pth_gmsg_t *m, *next, *rev;
+    int any = FALSE;
+
+    m = (pth_gmsg_t *)pth_atomic_ptr_xchg(&g->inbox, NULL);
+    /* reverse the LIFO push order to obtain FIFO fairness */
+    rev = NULL;
+    while (m != NULL) {
+        next = m->next;
+        m->next = rev;
+        rev = m;
+        m = next;
+    }
+    while (rev != NULL) {
+        next = rev->next;
+        if (rev->kind == PTH_GMSG_WAKE) {
+            /* mark the event as occurred; the event manager's cleanup
+               loop then moves the thread from the waiting queue to the
+               ready queue. A stale wakeup (waiter timed out and moved
+               on concurrently) at worst marks a static event that is
+               reset at its next use, which is harmless. */
+            if (rev->event != NULL)
+                rev->event->ev_status = PTH_STATUS_OCCURRED;
+        }
+        else if (rev->kind == PTH_GMSG_SPAWN) {
+            /* adopt a remotely spawned thread into our new queue */
+            rev->thread->state = PTH_STATE_NEW;
+            pth_pqueue_insert(&g->NQ, rev->thread->prio, rev->thread);
+        }
+        free(rev);
+        any = TRUE;
+        rev = next;
+    }
+    return any;
+}
+
 /*
  * Update the average scheduler load.
  *
@@ -452,6 +540,13 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     loop_entry:
     loop_repeat = FALSE;
 
+    /* clear the signal pipe and drain the wakeup inbox first: an already
+       delivered wakeup must prevent us from blocking in select(2) below
+       (producers push their message before writing the pipe byte) */
+    while (pth_sc(read)(g->sigpipe[0], minibuf, sizeof(minibuf)) > 0) ;
+    if (pth_gsched_drain(g))
+        dopoll = TRUE;
+
     /* initialize fd sets */
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
@@ -561,24 +656,10 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
                     if (pth_ring_elements(&(ev->ev_args.MSG.mp->mp_queue)) > 0)
                         this_occurred = TRUE;
                 }
-                /* Mutex Release */
-                else if (ev->ev_type == PTH_EVENT_MUTEX) {
-                    if (!(ev->ev_args.MUTEX.mutex->mx_state & PTH_MUTEX_LOCKED))
-                        this_occurred = TRUE;
-                }
-                /* Condition Variable Signal */
-                else if (ev->ev_type == PTH_EVENT_COND) {
-                    if (ev->ev_args.COND.cond->cn_state & PTH_COND_SIGNALED) {
-                        if (ev->ev_args.COND.cond->cn_state & PTH_COND_BROADCAST)
-                            this_occurred = TRUE;
-                        else {
-                            if (!(ev->ev_args.COND.cond->cn_state & PTH_COND_HANDLED)) {
-                                ev->ev_args.COND.cond->cn_state |= PTH_COND_HANDLED;
-                                this_occurred = TRUE;
-                            }
-                        }
-                    }
-                }
+                /* Mutex Release and Condition Variable Signal events
+                   are not polled anymore: threads park on the
+                   primitive's wait queue and are woken explicitly
+                   through the scheduler's wakeup inbox (pth_sync.c) */
                 /* Thread Termination */
                 else if (ev->ev_type == PTH_EVENT_TID) {
                     if (   (   ev->ev_args.TID.tid == NULL
@@ -636,8 +717,8 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
         pdelay = NULL;
     }
 
-    /* clear pipe and let select() wait for the read-part of the pipe */
-    while (pth_sc(read)(g->sigpipe[0], minibuf, sizeof(minibuf)) > 0) ;
+    /* let select() wait for the read-part of the signal pipe
+       (it was already cleared at the top of this event loop) */
     FD_SET(g->sigpipe[0], &rfds);
     if (fdmax < g->sigpipe[0])
         fdmax = g->sigpipe[0];
@@ -669,6 +750,11 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
     for (sig = 1; sig < PTH_NSIG; sig++)
         if (sigismember(&g->sigcatch, sig))
             sigaction(sig, &osa[sig], NULL);
+
+    /* drain the wakeup inbox again: messages which arrived while we
+       were sleeping in select(2) must be applied before the cleanup
+       loop below moves threads out of the waiting queue */
+    pth_gsched_drain(g);
 
     /* if the timer elapsed, handle it */
     if (!dopoll && rc == 0 && nexttimer_ev != NULL) {
@@ -820,20 +906,9 @@ intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
                         }
                     }
                 }
-                /*
-                 * post-processing for already occured events
-                 */
-                else {
-                    /* Condition Variable Signal */
-                    if (ev->ev_type == PTH_EVENT_COND) {
-                        /* clean signal */
-                        if (ev->ev_args.COND.cond->cn_state & PTH_COND_SIGNALED) {
-                            ev->ev_args.COND.cond->cn_state &= ~(PTH_COND_SIGNALED);
-                            ev->ev_args.COND.cond->cn_state &= ~(PTH_COND_BROADCAST);
-                            ev->ev_args.COND.cond->cn_state &= ~(PTH_COND_HANDLED);
-                        }
-                    }
-                }
+                /* (no post-processing of already occurred events is
+                   needed anymore: the condition variable signal flag
+                   machinery is gone) */
 
                 /* local to global mapping */
                 if (ev->ev_status != PTH_STATUS_PENDING)
