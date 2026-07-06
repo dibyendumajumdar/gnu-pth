@@ -250,7 +250,9 @@ struct pth_ring_st {
    /* mutex values */
 #define PTH_MUTEX_INITIALIZED        _BIT(0)
 #define PTH_MUTEX_LOCKED             _BIT(1)
+#define PTH_MUTEX_FAIR               _BIT(2)
 #define PTH_MUTEX_INIT               { {NULL, NULL}, PTH_MUTEX_INITIALIZED, NULL, 0, 0, {NULL, NULL} }
+#define PTH_MUTEX_INIT_FAIR          { {NULL, NULL}, PTH_MUTEX_INITIALIZED|PTH_MUTEX_FAIR, NULL, 0, 0, {NULL, NULL} }
 
    /* read-write lock values */
 enum { PTH_RWLOCK_RD, PTH_RWLOCK_RW };
@@ -511,6 +513,7 @@ extern pid_t          pth_fork(void);
 
     /* synchronization functions */
 extern int            pth_mutex_init(pth_mutex_t *);
+extern int            pth_mutex_setfair(pth_mutex_t *, int);
 extern int            pth_mutex_acquire(pth_mutex_t *, int, pth_event_t);
 extern int            pth_mutex_release(pth_mutex_t *);
 extern int            pth_rwlock_init(pth_rwlock_t *);

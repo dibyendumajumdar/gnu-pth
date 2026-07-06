@@ -107,15 +107,54 @@ int pth_mutex_init(pth_mutex_t *mutex)
     return TRUE;
 }
 
+/* select the fairness policy of a mutex: with fairness enabled the mutex
+   uses direct ownership handoff on release (the first queued waiter becomes
+   the owner while the lock stays held), giving FIFO ordering and preventing
+   the starvation possible under the default barging policy. Intended to be
+   called right after pth_mutex_init(3), before the mutex is contended. */
+int pth_mutex_setfair(pth_mutex_t *mutex, int fair)
+{
+    if (mutex == NULL)
+        return pth_error(FALSE, EINVAL);
+    if (!(mutex->mx_state & PTH_MUTEX_INITIALIZED))
+        return pth_error(FALSE, EDEADLK);
+    pth_spin_lock(&mutex->mx_lock);
+    if (fair)
+        mutex->mx_state |= PTH_MUTEX_FAIR;
+    else
+        mutex->mx_state &= ~PTH_MUTEX_FAIR;
+    pth_spin_unlock(&mutex->mx_lock);
+    return TRUE;
+}
+
 /* dequeue us from the wait queue if we get cancelled inside pth_wait(3),
    because otherwise a later releaser would touch our freed thread control
    block */
 static void pth_mutex_wait_cleanup(void *arg)
 {
     pth_mutex_t *mutex = (pth_mutex_t *)arg;
+    pth_t w;
 
     pth_spin_lock(&mutex->mx_lock);
-    pth_waitq_remove(&mutex->mx_waitq, pth_current);
+    if (mutex->mx_owner == pth_current) {
+        /* fair mode: we had been handed ownership (mutex still LOCKED) but
+           are being cancelled before we could take it. Pass the lock on to
+           the next waiter, or fully release it if the queue is now empty,
+           so the mutex is never left stuck owned by a dead thread. */
+        w = pth_waitq_shift(&mutex->mx_waitq);
+        if (w != NULL) {
+            mutex->mx_owner = w;
+            mutex->mx_count = 1;
+            pth_spin_unlock(&mutex->mx_lock);
+            pth_gsched_wake(w->sched_home, w, w->wq_event);
+            return;
+        }
+        mutex->mx_state &= ~(PTH_MUTEX_LOCKED);
+        mutex->mx_owner = NULL;
+        mutex->mx_count = 0;
+    }
+    else
+        pth_waitq_remove(&mutex->mx_waitq, pth_current);
     pth_spin_unlock(&mutex->mx_lock);
     return;
 }
@@ -178,6 +217,17 @@ int pth_mutex_acquire(pth_mutex_t *mutex, int tryonly, pth_event_t ev_extra)
         pth_cleanup_pop(FALSE);
 
         pth_spin_lock(&mutex->mx_lock);
+        /* fair mode: the releaser may have handed ownership directly to us
+           (mutex kept LOCKED, mx_owner set to us, and we were already
+           dequeued). Recognise that and take the lock without re-contending. */
+        if (mutex->mx_owner == pth_current) {
+            pth_spin_unlock(&mutex->mx_lock);
+            if (ev_extra != NULL)
+                pth_event_isolate(ev);
+            pth_ring_append(&(pth_current->mutexring), &(mutex->mx_node));
+            pth_debug1("pth_mutex_acquire: acquired mutex via fair handoff");
+            return TRUE;
+        }
         /* no-op if the releaser already dequeued us */
         pth_waitq_remove(&mutex->mx_waitq, pth_current);
         if (ev_extra != NULL) {
@@ -220,15 +270,30 @@ int pth_mutex_release(pth_mutex_t *mutex)
     pth_spin_lock(&mutex->mx_lock);
     mutex->mx_count--;
     if (mutex->mx_count <= 0) {
-        mutex->mx_state &= ~(PTH_MUTEX_LOCKED);
-        mutex->mx_owner = NULL;
-        mutex->mx_count = 0;
         w = pth_waitq_shift(&mutex->mx_waitq);
-        pth_spin_unlock(&mutex->mx_lock);
-        pth_ring_delete(&(pth_current->mutexring), &(mutex->mx_node));
-        /* hand a directed wakeup to the first waiter (if any) */
-        if (w != NULL)
+        if (w != NULL && (mutex->mx_state & PTH_MUTEX_FAIR)) {
+            /* fair mode: hand ownership directly to the first waiter so no
+               newly arriving thread can barge ahead of the queue. The mutex
+               stays LOCKED throughout; the woken waiter finds itself already
+               the owner and appends the mutex to its own mutexring (we must
+               not touch a foreign thread's ring). */
+            mutex->mx_owner = w;
+            mutex->mx_count = 1;
+            pth_spin_unlock(&mutex->mx_lock);
+            pth_ring_delete(&(pth_current->mutexring), &(mutex->mx_node));
             pth_gsched_wake(w->sched_home, w, w->wq_event);
+        }
+        else {
+            /* barging mode (default): drop the lock and wake one waiter,
+               which re-contends for the mutex on resume */
+            mutex->mx_state &= ~(PTH_MUTEX_LOCKED);
+            mutex->mx_owner = NULL;
+            mutex->mx_count = 0;
+            pth_spin_unlock(&mutex->mx_lock);
+            pth_ring_delete(&(pth_current->mutexring), &(mutex->mx_node));
+            if (w != NULL)
+                pth_gsched_wake(w->sched_home, w, w->wq_event);
+        }
     }
     else
         pth_spin_unlock(&mutex->mx_lock);

@@ -127,6 +127,7 @@ pth_fork.
 =item B<Synchronization>
 
 pth_mutex_init,
+pth_mutex_setfair,
 pth_mutex_acquire,
 pth_mutex_release,
 pth_rwlock_init,
@@ -1416,6 +1417,20 @@ the event mechanism.
 This dynamically initializes a mutex variable of type `C<pth_mutex_t>'.
 Alternatively one can also use static initialization via `C<pth_mutex_t
 mutex = PTH_MUTEX_INIT>'.
+
+=item int B<pth_mutex_setfair>(pth_mutex_t *I<mutex>, int I<fair>);
+
+This selects the fairness policy of I<mutex> and is intended to be called
+right after B<pth_mutex_init>(3), before the mutex is contended. By default
+a mutex uses a I<barging> policy: on release the lock is simply marked free
+and one waiting thread is woken to re-contend for it, which can let a thread
+that repeatedly re-acquires the mutex starve the waiters. When I<fair> is
+C<TRUE> the mutex instead uses direct I<ownership handoff>: on release the
+lock is passed straight to the first queued waiter (the lock is never left
+free while waiters exist), giving FIFO ordering and preventing starvation, at
+a small throughput cost. When I<fair> is C<FALSE> the default barging policy
+is restored. A statically initialized fair mutex can be declared with
+`C<pth_mutex_t mutex = PTH_MUTEX_INIT_FAIR>'.
 
 =item int B<pth_mutex_acquire>(pth_mutex_t *I<mutex>, int I<try>, pth_event_t I<ev>);
 
