@@ -36,8 +36,11 @@ if(PTH_BUILD_PTHREAD)
     set(PTH_SYSCALL_SOFT ON)  # configure.ac forces this for --enable-pthread
 endif()
 if(PTH_MP AND PTH_BUILD_PTHREAD)
-    message(FATAL_ERROR "PTH_MP uses the system pthread library internally and "
-                        "cannot be combined with the pthread emulation library")
+    # The emulation owns the pthread_* symbols, so the MP core reaches the
+    # real OS-thread primitives via dlsym(RTLD_NEXT) (see pth_sched.c, guarded
+    # by PTH_EMULATION). pthread_create(3) then round-robins new threads
+    # across the schedulers.
+    message(STATUS "Building pthread emulation with multi-scheduler (PTH_MP) support")
 endif()
 
 include(CheckIncludeFile)
@@ -439,7 +442,8 @@ if(PTH_BUILD_PTHREAD)
     add_library(pth_pthread ${PTH_SOURCES} pthread.c)
     add_dependencies(pth_pthread pth_p_h)
     target_include_directories(pth_pthread PUBLIC "${GEN}" "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(pth_pthread PUBLIC ${PTH_EXTRA_LIBS})
+    target_compile_definitions(pth_pthread PRIVATE PTH_EMULATION)
+    target_link_libraries(pth_pthread PUBLIC ${PTH_EXTRA_LIBS} ${CMAKE_DL_LIBS})
     if(PTH_MP)
         target_compile_definitions(pth_pthread PUBLIC PTH_MP)
         target_link_libraries(pth_pthread PUBLIC Threads::Threads)
@@ -464,6 +468,13 @@ if(PTH_BUILD_TESTS)
     if(PTH_BUILD_PTHREAD)
         add_executable(test_pthread test_pthread.c test_common.c)
         target_link_libraries(test_pthread PRIVATE pth_pthread)
+        if(PTH_MP)
+            # verifies pthread_create(3) spreads threads across schedulers
+            add_executable(test_pthread_mp test_pthread_mp.c)
+            target_link_libraries(test_pthread_mp PRIVATE pth_pthread)
+            add_test(NAME test_pthread_mp COMMAND test_pthread_mp)
+            set_tests_properties(test_pthread_mp PROPERTIES TIMEOUT 120)
+        endif()
     endif()
     # Only test_std and test_uctx are self-terminating, non-interactive tests;
     # the others (mp, sig, philo, misc, select, httpd) are interactive demos.

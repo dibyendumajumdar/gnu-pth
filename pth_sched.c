@@ -25,11 +25,56 @@
                              /* ``Recursive, adj.;
                                   see Recursive.''
                                      -- Unknown   */
+/* RTLD_NEXT (used by the MP+emulation OS-thread shim below) needs _GNU_SOURCE
+   defined before any system header is pulled in via pth_p.h */
+#if defined(PTH_MP) && defined(PTH_EMULATION) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
 #include "pth_p.h"
 
 #ifdef PTH_MP
-#include <pthread.h>
+/*
+ * OS-thread primitives for the auxiliary schedulers. When Pth is built as
+ * the POSIX pthread emulation (PTH_EMULATION, i.e. pthread.c is linked in),
+ * the pthread_* symbols are the emulation's own, so we must reach the REAL
+ * libc primitives via dlsym(RTLD_NEXT). pthread_t is unsigned long on the
+ * supported targets, which is exactly what pth_gsched_st.osthread stores.
+ */
+#if defined(PTH_EMULATION)
+#include <dlfcn.h>
+#include <signal.h>
+typedef int (*pth_osc_fp)(unsigned long *, const void *, void *(*)(void *), void *);
+typedef int (*pth_osj_fp)(unsigned long, void **);
+typedef int (*pth_oss_fp)(int, const sigset_t *, sigset_t *);
+static pth_osc_fp pth_os_create_fp  = NULL;
+static pth_osj_fp pth_os_join_fp    = NULL;
+static pth_oss_fp pth_os_sigmask_fp = NULL;
+static void pth_os_resolve(void)
+{
+    if (pth_os_create_fp == NULL) {
+        pth_os_create_fp  = (pth_osc_fp)dlsym(RTLD_NEXT, "pthread_create");
+        pth_os_join_fp    = (pth_osj_fp)dlsym(RTLD_NEXT, "pthread_join");
+        pth_os_sigmask_fp = (pth_oss_fp)dlsym(RTLD_NEXT, "pthread_sigmask");
+    }
+}
+#define PTH_OS_CREATE(ptid, fn, arg) (pth_os_resolve(), pth_os_create_fp((ptid), NULL, (fn), (arg)))
+#define PTH_OS_JOIN(tid)             (pth_os_resolve(), pth_os_join_fp((tid), NULL))
+#define PTH_OS_SIGMASK(how, s, o)    (pth_os_resolve(), pth_os_sigmask_fp((how), (s), (o)))
+#else
+/* Do NOT pull in <pthread.h> here: in a combined build (core lib + pthread
+   emulation) Pth's own pthread.h can shadow the system one and clash. We
+   need only three primitives, so declare them directly (pthread_t is
+   unsigned long on the supported targets). pthread_sigmask's signature
+   matches <signal.h>, so a redundant declaration from there is harmless. */
+#include <signal.h>
+extern int pthread_create(unsigned long *, const void *, void *(*)(void *), void *);
+extern int pthread_join(unsigned long, void **);
+extern int pthread_sigmask(int, const sigset_t *, sigset_t *);
+#define PTH_OS_CREATE(ptid, fn, arg) pthread_create((ptid), NULL, (fn), (arg))
+#define PTH_OS_JOIN(tid)             pthread_join((tid), NULL)
+#define PTH_OS_SIGMASK(how, s, o)    pthread_sigmask((how), (s), (o))
 #endif
+#endif /* PTH_MP */
 
 #if cpp
 
@@ -1570,7 +1615,7 @@ static void *pth_gsched_bootstrap(void *arg)
 
     /* signals are the business of scheduler 0 only */
     sigfillset(&ss);
-    pthread_sigmask(SIG_SETMASK, &ss, NULL);
+    PTH_OS_SIGMASK(SIG_SETMASK, &ss, NULL);
 
     /* per-scheduler state (queues, signal pipe, inbox) */
     if (!pth_scheduler_init()) {
@@ -1632,18 +1677,16 @@ int pth_mp_init(int nsched)
 #else
     while (pth_atomic_load(&pth_gsched_ntab) < nsched) {
         pth_gsched_t *g;
-        pthread_t pt;
         int id = pth_atomic_load(&pth_gsched_ntab);
 
         if ((g = (pth_gsched_t *)calloc(1, sizeof(pth_gsched_t))) == NULL)
             return pth_error(FALSE, ENOMEM);
         g->id = id;
         pth_atomic_store(&g->boot_done, 0);
-        if (pthread_create(&pt, NULL, pth_gsched_bootstrap, g) != 0) {
+        if (PTH_OS_CREATE(&g->osthread, pth_gsched_bootstrap, g) != 0) {
             free(g);
             return pth_error(FALSE, EAGAIN);
         }
-        g->osthread = (unsigned long)pt;
         while (!pth_atomic_load(&g->boot_done))
             pth_nap(pth_time(0, 1000));
         if (!g->boot_rc) {
@@ -1680,7 +1723,7 @@ int pth_mp_shutdown(void)
     while (pth_atomic_load(&pth_gsched_nexited) < n - 1)
         pth_nap(pth_time(0, 1000));
     for (i = 1; i < n; i++) {
-        pthread_join((pthread_t)pth_gsched_tab[i]->osthread, NULL);
+        PTH_OS_JOIN(pth_gsched_tab[i]->osthread);
         free(pth_gsched_tab[i]);
         pth_gsched_tab[i] = NULL;
     }

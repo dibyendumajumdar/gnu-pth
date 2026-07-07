@@ -535,3 +535,47 @@ pass rather than cached on the scheduler struct, and the millisecond timeout
 granularity of `poll()` is coarser than select's microseconds (rounded up, so
 never a busy-spin). A stateful `epoll`/`kqueue` backend behind the same
 dispatcher remains the scalable end goal (§ discussion).
+
+## 13. Phase 4: multi-scheduler pthread emulation
+
+The POSIX pthread emulation (`pthread.c`) now works together with `PTH_MP`,
+so existing pthreads programs get multi-core parallelism by relinking against
+`libpthread` (Pth's) with no source changes. `pthread_create(3)` round-robins
+new threads across the schedulers via `pth_spawn_on()`; `pthread_join(3)` rides
+on the cross-scheduler join of §11; the mutex/cond/rwlock emulation already
+maps onto the cross-scheduler-safe primitives.
+
+**The symbol-collision problem.** `PTH_MP` needs the *real* libc
+`pthread_create`/`pthread_join`/`pthread_sigmask` to run its scheduler OS
+threads, but the emulation *is* those symbols. Resolution (in `pth_sched.c`,
+selected by the `PTH_EMULATION` compile flag set only on the emulation
+library):
+
+* **Emulation build** (`PTH_MP && PTH_EMULATION`): the real primitives are
+  fetched once via `dlsym(RTLD_NEXT, …)`, which skips the emulation's own
+  symbols and finds libc's. `_GNU_SOURCE` is defined at the top of the file
+  (before any header) so `RTLD_NEXT` is visible; the library links `libdl`.
+* **Plain MP build** (`PTH_MP`, no emulation): `pth_sched.c` deliberately does
+  *not* `#include <pthread.h>` — in a combined build Pth's own `pthread.h` can
+  shadow the system one — and instead declares the three primitives directly
+  (`pthread_t` is `unsigned long` on the supported targets, matching the
+  `osthread` field).
+
+Both go through one set of `PTH_OS_{CREATE,JOIN,SIGMASK}` macros, so the
+scheduler bootstrap/shutdown code is backend-agnostic.
+
+**Startup / shutdown.** The first pthread call runs `pth_mp_init(N)` where
+`N = $PTH_SCHEDULERS` if set, else the online CPU count (clamped to
+`PTH_GSCHED_MAX`); the `atexit` handler runs `pth_mp_shutdown()` before
+`pth_kill()`. CMake gains no new option — building `-DPTH_BUILD_PTHREAD=ON
+-DPTH_MP=ON` is now allowed (the former `FATAL_ERROR` is gone) and compiles
+the emulation with `PTH_EMULATION` + `libdl`.
+
+`test_pthread_mp.c` confirms distribution: N pthreads report a spread of
+distinct OS-thread ids (`gettid`, one per scheduler, no migration) and a
+`pthread_mutex`-protected counter stays exact under the real parallelism.
+
+Caveat: the `pthread_t == unsigned long` assumption and `dlsym(RTLD_NEXT)`
+symbol interposition target glibc/musl-style dynamic linking; fully static
+executables or platforms with a struct `pthread_t` would need a small porting
+shim.

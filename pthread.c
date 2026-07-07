@@ -53,8 +53,37 @@
 **  GLOBAL STUFF
 */
 
+#ifdef PTH_MP
+#include <unistd.h>
+/* round-robin cursor used to spread pthread_create(3) across schedulers */
+static pth_atomic_t pthread_rr = PTH_ATOMIC_INIT(0);
+/* number of schedulers to start: $PTH_SCHEDULERS if set, else the online
+   CPU count, clamped to what pth_mp_init(3) accepts */
+static int pthread_nsched_want(void)
+{
+    const char *e = getenv("PTH_SCHEDULERS");
+    long n = 0;
+    if (e != NULL)
+        n = atol(e);
+    if (n < 1) {
+        n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1)
+            n = 1;
+    }
+    if (n > PTH_GSCHED_MAX)
+        n = PTH_GSCHED_MAX;
+    return (int)n;
+}
+#define PTHREAD_MP_STARTUP()  ((void)pth_mp_init(pthread_nsched_want()))
+#else
+#define PTHREAD_MP_STARTUP()  /* single scheduler */
+#endif
+
 static void pthread_shutdown(void)
 {
+#ifdef PTH_MP
+    pth_mp_shutdown();   /* join auxiliary schedulers before tearing down */
+#endif
     pth_kill();
     return;
 }
@@ -66,6 +95,7 @@ static int pthread_initialized = FALSE;
         if (pthread_initialized == FALSE) { \
             pthread_initialized = TRUE; \
             pth_init(); \
+            PTHREAD_MP_STARTUP(); \
             atexit(pthread_shutdown); \
         } \
     } while (0)
@@ -302,7 +332,15 @@ int pthread_create(
         na = (pth_attr_t)(*attr);
     else
         na = PTH_ATTR_DEFAULT;
+#ifdef PTH_MP
+    {
+        int ns = pth_sched_count();
+        int sid = (ns > 1) ? (int)((unsigned)pth_atomic_inc(&pthread_rr) % (unsigned)ns) : 0;
+        *thread = (pthread_t)pth_spawn_on(sid, na, start_routine, arg);
+    }
+#else
     *thread = (pthread_t)pth_spawn(na, start_routine, arg);
+#endif
     if (*thread == NULL)
         return pth_error(EAGAIN, EAGAIN);
     return OK;
