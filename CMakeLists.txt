@@ -23,8 +23,8 @@ option(PTH_BUILD_PTHREAD "Build POSIX pthread emulation library"      OFF)
 option(PTH_DEBUG         "Enable Pth debugging"                       OFF)
 option(PTH_SYSCALL_SOFT  "Enable soft system call mapping"            OFF)
 option(PTH_SYSCALL_HARD  "Enable hard system call mapping"            OFF)
-option(PTH_MP            "Enable multi-scheduler (multi-CPU) support" OFF)
-option(PTH_SCHED_POLL   "Use poll(2) not select(2) in the scheduler core (no FD_SETSIZE ceiling)" OFF)
+option(PTH_MP            "Enable multi-scheduler (multi-CPU) support" ON)
+option(PTH_SCHED_POLL   "Use poll(2) not select(2) in the scheduler core (no FD_SETSIZE ceiling)" ON)
 # BUILD_SHARED_LIBS selects static (default) vs shared library
 
 # mctx overrides (equivalent to --with-mctx-mth/dsp/stk); empty = autodetect
