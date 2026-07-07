@@ -805,13 +805,34 @@ int pth_nap(pth_time_t naptime)
 }
 
 /* runs a constructor once */
+/*
+ * pth_once uses the control word as a small atomic state machine so that,
+ * under multi-scheduler (MP) operation, concurrent callers run the
+ * constructor exactly once: 0 = uninitialized (== PTH_ONCE_INIT), 1 =
+ * initialization in progress, 2 = done. The winner of the 0->1 CAS runs the
+ * constructor and publishes 2; the losers wait cooperatively until they
+ * observe 2 (POSIX requires the constructor to have completed on return). We
+ * do not hold a lock across the user constructor, which may itself call back
+ * into Pth or block.
+ */
 int pth_once(pth_once_t *oncectrl, void (*constructor)(void *), void *arg)
 {
     if (oncectrl == NULL || constructor == NULL)
         return pth_error(FALSE, EINVAL);
-    if (*oncectrl != TRUE)
-        constructor(arg);
-    *oncectrl = TRUE;
-    return TRUE;
+    for (;;) {
+        int st = pth_atomic_load(oncectrl);
+        if (st == 2)
+            return TRUE;                      /* already initialized */
+        if (st == 0) {
+            if (pth_atomic_cas(oncectrl, 0, 1)) {
+                constructor(arg);             /* we won: run it once */
+                pth_atomic_store(oncectrl, 2);
+                return TRUE;
+            }
+            /* lost the race; loop and observe the new state */
+        }
+        else /* st == 1: another caller is initializing */
+            pth_yield(NULL);                  /* wait cooperatively for it */
+    }
 }
 

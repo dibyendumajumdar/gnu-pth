@@ -877,3 +877,22 @@ C<REVIEW.md> for the full write-up):
 
 `test_cancelblock_mp.c` regression-tests the first two (and is confirmed to core
 dump against a build with the cleanup-context fix reverted).
+
+## 20. Follow-up review fixes
+
+A second review round raised two more items:
+
+* **`pth_once`/`pthread_once` were not MP-safe** (racy check-then-set: two
+  schedulers could both run the initializer). Now an atomic state machine
+  (0 uninit / 1 in-progress / 2 done) via `pth_atomic_cas`; the CAS winner runs
+  the initializer once and publishes done, losers `pth_yield` until they observe
+  done (no lock held across the user initializer). Test `test_once_mp.c` (40
+  callers over 4 schedulers) confirms exactly-once and, against the old code,
+  reproduces the multiple-init bug.
+* **Message-port object lifetime is not library-managed.** The registry and per
+  port operations are locked, but `pth_msgport_find` returns a raw pointer whose
+  target another scheduler could `pth_msgport_destroy`. Rather than add
+  reference counting to an API with no ownership model, the lifetime contract is
+  documented (pth.pod): a port must outlive all threads that may use a reference
+  to it; destruction is the application's responsibility to serialize.
+  `test_msgport_mp.c` exercises the safe pattern.

@@ -150,3 +150,37 @@ registered tests in that build (`test_std`, `test_uctx`, `test_sync`,
 `test_join_mp`, `test_cancelblock_mp`, `test_cancelraise_mp`,
 `test_suspend_mp`, `test_msgport_mp`, and `test_mutexfair_mp`.
 
+
+---
+
+## Follow-up Resolution
+
+### High — `pth_once()` / `pthread_once()` not MP-safe: FIXED
+Both now drive the control word as an atomic state machine (0 = uninitialized,
+which is C<PTH_ONCE_INIT>/`PTHREAD_ONCE_INIT`; 1 = in progress; 2 = done) using
+the existing `pth_atomic_cas`/`pth_atomic_load`/`pth_atomic_store` (real atomics
+under `PTH_MP`, trivial otherwise). The winner of the `0 -> 1` CAS runs the
+initializer once and publishes `2`; other callers spin cooperatively
+(`pth_yield`) until they observe `2`, so the initializer has completed on
+return (POSIX semantics). No lock is held across the user initializer, which may
+call back into Pth or block.
+
+New `test_once_mp.c`: 40 callers spread over 4 schedulers race on one control
+with a deliberately widened initializer window. With the fix the constructor
+runs exactly once (`constructor_runs=1`); against the old check-then-set it runs
+up to 40 times — so the test demonstrably catches the regression.
+
+### Medium — named message-port lookup lifetime race: DOCUMENTED (by design)
+The registry ring traversal and each port operation are internally synchronized
+(finding from the first review), but the I<lifetime> of a port object cannot be
+managed by the library without adding reference counting to an API that has no
+ownership/`release` model -- which would be a semantic API change out of scope
+here. Per the review's third accepted option, the lifetime contract is now
+documented explicitly: a port must not be destroyed while another thread still
+holds and may use a reference obtained from `pth_msgport_create`/`_find`;
+destruction is the application's responsibility to serialize (typically the
+owning/creator thread destroys it only after establishing, via join/barrier,
+that no other thread will touch it). See the lifetime notes added to
+`pth_msgport_destroy(3)`/`pth_msgport_find(3)` in pth.pod. `test_msgport_mp.c`
+already exercises the safe cross-scheduler pattern (owner keeps the port alive
+across all senders, destroys only after they finish).

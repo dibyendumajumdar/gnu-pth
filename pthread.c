@@ -402,10 +402,22 @@ int pthread_once(
     pthread_initialize();
     if (once_control == NULL || init_routine == NULL)
         return pth_error(EINVAL, EINVAL);
-    if (*once_control != 1)
-        init_routine();
-    *once_control = 1;
-    return OK;
+    /* atomic once semantics (see pth_once): 0 = uninitialized
+       (== PTHREAD_ONCE_INIT), 1 = in progress, 2 = done */
+    for (;;) {
+        int st = pth_atomic_load(once_control);
+        if (st == 2)
+            return OK;
+        if (st == 0) {
+            if (pth_atomic_cas(once_control, 0, 1)) {
+                init_routine();
+                pth_atomic_store(once_control, 2);
+                return OK;
+            }
+        }
+        else
+            pth_yield(NULL);
+    }
 }
 
 int pthread_sigmask(int how, const sigset_t *set, sigset_t *oset)

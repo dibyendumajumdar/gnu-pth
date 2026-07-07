@@ -1432,10 +1432,25 @@ directly the pointer to the message port.
 This destroys a message port I<mp>. Before all pending messages on it are
 replied to their origin message port.
 
+B<Lifetime under M:N.> The individual message-port operations are internally
+synchronized (see above), but the I<lifetime> of a port object is the
+application's responsibility: a port must not be destroyed while another thread
+still holds a reference to it (one returned by pth_msgport_create(3) or
+pth_msgport_find(3)) and may still call pth_msgport_put(3),
+pth_msgport_get(3), pth_msgport_pending(3) or pth_msgport_reply(3) on it.
+Destroying a port concurrently with such use is undefined behaviour, exactly as
+for any shared object whose storage the library does not reference-count. The
+safe idiom is for one thread (typically the creator, I<mp_tid>) to own the port
+and to destroy it only after it has established -- by joining, a barrier, or
+other synchronization -- that no other thread will use it again.
+
 =item pth_msgport_t B<pth_msgport_find>(const char *I<name>);
 
 This finds a message port in the system by I<name> and returns the pointer to
-it.
+it. Under M:N the returned pointer is only valid as long as the port is kept
+alive by its owner (see the lifetime note under pth_msgport_destroy(3)); the
+lookup itself is synchronized against concurrent create/destroy, but the caller
+must not race a destroy of the found port against its subsequent use.
 
 =item int B<pth_msgport_pending>(pth_msgport_t I<mp>);
 
