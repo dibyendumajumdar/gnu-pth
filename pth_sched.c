@@ -160,6 +160,7 @@ struct pth_gmsg_st {
 #define PTH_GMSG_SUSPEND 7
 #define PTH_GMSG_RESUME  8
 #define PTH_GMSG_FAVOR   9
+#define PTH_GMSG_ABORT   10
 
 #endif /* cpp */
 
@@ -409,6 +410,10 @@ intern int pth_gsched_drain(pth_gsched_t *g)
         else if (rev->kind == PTH_GMSG_FAVOR) {
             /* yield-to hint: bump a thread we own to the front of its queue */
             pth_favor_local(rev->thread);
+        }
+        else if (rev->kind == PTH_GMSG_ABORT) {
+            /* force-abort a thread we own (detach + async cancel; see pth_cancel.c) */
+            pth_abort_local(rev->thread);
         }
         free(rev);
         any = TRUE;

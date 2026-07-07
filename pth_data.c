@@ -70,8 +70,12 @@ int pth_key_setdata(pth_key_t key, const void *value)
 {
     if (key < 0 || key >= PTH_KEY_MAX)
         return pth_error(FALSE, EINVAL);
-    if (!pth_keytab[key].used)
+    pth_spin_lock(&pth_keytab_lock);
+    if (!pth_keytab[key].used) {
+        pth_spin_unlock(&pth_keytab_lock);
         return pth_error(FALSE, ENOENT);
+    }
+    pth_spin_unlock(&pth_keytab_lock);
     if (pth_current->data_value == NULL) {
         pth_current->data_value = (const void **)calloc(1, sizeof(void *)*PTH_KEY_MAX);
         if (pth_current->data_value == NULL)
@@ -93,8 +97,12 @@ void *pth_key_getdata(pth_key_t key)
 {
     if (key < 0 || key >= PTH_KEY_MAX)
         return pth_error((void *)NULL, EINVAL);
-    if (!pth_keytab[key].used)
+    pth_spin_lock(&pth_keytab_lock);
+    if (!pth_keytab[key].used) {
+        pth_spin_unlock(&pth_keytab_lock);
         return pth_error((void *)NULL, ENOENT);
+    }
+    pth_spin_unlock(&pth_keytab_lock);
     if (pth_current->data_value == NULL)
         return (void *)NULL;
     return (void *)pth_current->data_value[key];
@@ -117,6 +125,9 @@ intern void pth_key_destroydata(pth_t t)
             if (t->data_count > 0) {
                 destructor = NULL;
                 data = NULL;
+                /* snapshot the key's validity + destructor consistently; a
+                   concurrent pth_key_delete/create must not tear this read */
+                pth_spin_lock(&pth_keytab_lock);
                 if (pth_keytab[key].used) {
                     if (t->data_value[key] != NULL) {
                         data = (void *)t->data_value[key];
@@ -125,6 +136,8 @@ intern void pth_key_destroydata(pth_t t)
                         destructor = pth_keytab[key].destructor;
                     }
                 }
+                pth_spin_unlock(&pth_keytab_lock);
+                /* run the user destructor OUTSIDE the spinlock */
                 if (destructor != NULL)
                     destructor(data);
             }

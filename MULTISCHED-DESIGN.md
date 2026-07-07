@@ -849,3 +849,31 @@ the select and poll backends.
 With this every original Pth thread-control verb operates across schedulers; the
 only remaining single-scheduler-bound facilities are process signals
 (`PTH_EVENT_SIGS`/`pth_sigwait`, scheduler-0 only) and `pth_fork` (§15).
+
+## 19. Correctness fixes from code review
+
+A review of the phase-4 work surfaced three defects, since fixed (see
+C<REVIEW.md> for the full write-up):
+
+* **Async cancellation ran cleanup handlers in the wrong thread context.**
+  `pth_cleanup_popall()` invokes a thread's cleanup handlers without making that
+  thread current, so for *asynchronous* cancellation driven from the scheduler
+  side the internal sync-primitive wait cleanups (which use `pth_current` to
+  pick the waiter) removed the wrong entry -- leaving the cancelled thread
+  stranded in a mutex/cond/rwlock wait queue (a later release then hit
+  use-after-free), and `pth_mutex_releaseall()` failed to release a cancelled
+  holder's mutexes (its `mx_owner == pth_current` check). Fix: `pth_thread_cleanup()`
+  now sets `pth_current` to the target thread around the whole body. This was a
+  latent bug introduced by the phase-2 conversion of the primitives to explicit
+  wait queues; it affects single-scheduler async cancellation too.
+* **`pth_abort()` mutated a foreign TCB directly.** It set `joinable` /
+  `cancelstate` on the target before delegating to `pth_cancel()`; for a foreign
+  target that raced the owning scheduler. Fix: a `PTH_GMSG_ABORT` inbox message
+  routes the whole operation to the home scheduler (`pth_abort_local`).
+* **TSD key-table reads were unlocked.** `pth_key_{set,get,destroy}data` read
+  `pth_keytab[].used`/`.destructor` without the key-table spinlock, racing with
+  `pth_key_create`/`pth_key_delete` on another scheduler. Fix: guard those reads;
+  `destroydata` snapshots under the lock and runs the destructor outside it.
+
+`test_cancelblock_mp.c` regression-tests the first two (and is confirmed to core
+dump against a build with the cleanup-context fix reverted).

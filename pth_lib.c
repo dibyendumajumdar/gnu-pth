@@ -448,6 +448,22 @@ intern int pth_thread_exists(pth_t t)
 /* cleanup a particular thread */
 intern void pth_thread_cleanup(pth_t thread)
 {
+    pth_t current_saved;
+
+    /* Run the target thread's cleanup handlers, TSD destructors and mutex
+       release *as if it were the current thread*. This matters for
+       asynchronous cancellation, where this runs from another (e.g. the
+       scheduler's) context: the internal sync-primitive wait cleanups and
+       pth_mutex_releaseall() consult pth_current to identify the waiter /
+       lock owner, so without this they would touch the wrong thread (leaving
+       the cancelled thread stranded in a primitive wait queue, or failing to
+       release a mutex it holds). It is also correct POSIX semantics: cleanup
+       handlers and destructors run in the cancelled thread's context. When
+       called from pth_exit()/pth_kill() pth_current already equals thread, so
+       this is a no-op there. No context switch occurs in the body. */
+    current_saved = pth_current;
+    pth_current = thread;
+
     /* run the cleanup handlers */
     if (thread->cleanups != NULL)
         pth_cleanup_popall(thread, TRUE);
@@ -459,6 +475,7 @@ intern void pth_thread_cleanup(pth_t thread)
     /* release still acquired mutex variables */
     pth_mutex_releaseall(thread);
 
+    pth_current = current_saved;
     return;
 }
 

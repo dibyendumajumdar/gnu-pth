@@ -144,6 +144,28 @@ int pth_cancel(pth_t thread)
     return pth_cancel_local(thread);
 }
 
+/* force-abort a thread we own: detach it and cancel it asynchronously (or
+   reap it if already dead). Runs directly (same scheduler) or from the home
+   scheduler's inbox drain for a cross-scheduler request. */
+intern void pth_abort_local(pth_t thread)
+{
+    if (!pth_thread_exists(thread))
+        return;
+    if (thread->state == PTH_STATE_DEAD) {
+        /* already terminated: reap it (we own its dead queue) */
+        if (thread->joinable) {
+            pth_pqueue_delete(&pth_DQ, thread);
+            pth_tcb_free(thread);
+        }
+        return;
+    }
+    /* force detach and asynchronous cancellation */
+    thread->joinable = FALSE;
+    thread->cancelstate = (PTH_CANCEL_ENABLE|PTH_CANCEL_ASYNCHRONOUS);
+    (void)pth_cancel_local(thread);
+    return;
+}
+
 /* abort a thread (the cruel way) */
 int pth_abort(pth_t thread)
 {
@@ -153,6 +175,16 @@ int pth_abort(pth_t thread)
     /* the current thread cannot be aborted */
     if (thread == pth_current)
         return pth_error(FALSE, EINVAL);
+
+    /* cross-scheduler: the target's home scheduler owns its TCB and run
+       queues, so it must perform the detach + cancel (writing joinable /
+       cancelstate here would race the target scheduler). sched_home is
+       immutable, so the check is safe. */
+    if (thread->sched_home != pth_gsched_active) {
+        if (!pth_gsched_post(thread->sched_home, PTH_GMSG_ABORT, thread, NULL))
+            return pth_error(FALSE, EAGAIN);
+        return TRUE;
+    }
 
     if (thread->state == PTH_STATE_DEAD && thread->joinable) {
         /* if thread is already terminated, just join it */
