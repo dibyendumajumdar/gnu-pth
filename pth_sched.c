@@ -157,6 +157,9 @@ struct pth_gmsg_st {
 #define PTH_GMSG_REAP   4
 #define PTH_GMSG_CANCEL 5
 #define PTH_GMSG_RAISE  6
+#define PTH_GMSG_SUSPEND 7
+#define PTH_GMSG_RESUME  8
+#define PTH_GMSG_FAVOR   9
 
 #endif /* cpp */
 
@@ -394,6 +397,18 @@ intern int pth_gsched_drain(pth_gsched_t *g)
         else if (rev->kind == PTH_GMSG_RAISE) {
             /* deliver a cross-scheduler raised signal locally (see pth_lib.c) */
             pth_raise_local(rev->thread, rev->sig);
+        }
+        else if (rev->kind == PTH_GMSG_SUSPEND) {
+            /* suspend a thread we own (see pth_lib.c) */
+            (void)pth_suspend_local(rev->thread);
+        }
+        else if (rev->kind == PTH_GMSG_RESUME) {
+            /* resume a thread we own (see pth_lib.c) */
+            (void)pth_resume_local(rev->thread);
+        }
+        else if (rev->kind == PTH_GMSG_FAVOR) {
+            /* yield-to hint: bump a thread we own to the front of its queue */
+            pth_favor_local(rev->thread);
         }
         free(rev);
         any = TRUE;

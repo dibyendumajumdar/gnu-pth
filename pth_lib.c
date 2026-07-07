@@ -614,20 +614,24 @@ int pth_yield(pth_t to)
 
     /* a given thread has to be new or ready or we ignore the request */
     if (to != NULL) {
-        if (to->sched_home != pth_gsched_active)
-            return pth_error(FALSE, EINVAL); /* no cross-scheduler yield */
-        switch (to->state) {
-            case PTH_STATE_NEW:    q = &pth_NQ; break;
-            case PTH_STATE_READY:  q = &pth_RQ; break;
-            default:               q = NULL;
+        if (to->sched_home != pth_gsched_active) {
+            /* cross-scheduler yield-to: we cannot favour a thread that runs on
+               another scheduler, so hand its home scheduler a hint to bump it
+               and then simply yield our own scheduler (like pth_yield(NULL)) */
+            (void)pth_gsched_post(to->sched_home, PTH_GMSG_FAVOR, to, NULL);
         }
-        if (q == NULL || !pth_pqueue_contains(q, to))
-            return pth_error(FALSE, EINVAL);
+        else {
+            switch (to->state) {
+                case PTH_STATE_NEW:    q = &pth_NQ; break;
+                case PTH_STATE_READY:  q = &pth_RQ; break;
+                default:               q = NULL;
+            }
+            if (q == NULL || !pth_pqueue_contains(q, to))
+                return pth_error(FALSE, EINVAL);
+            /* give a favored thread maximum priority in his queue */
+            pth_pqueue_favorite(q, to);
+        }
     }
-
-    /* give a favored thread maximum priority in his queue */
-    if (to != NULL && q != NULL)
-        pth_pqueue_favorite(q, to);
 
     /* switch to scheduler */
     if (to != NULL)
@@ -642,17 +646,19 @@ int pth_yield(pth_t to)
     return TRUE;
 }
 
-/* suspend a thread until its again manually resumed */
-int pth_suspend(pth_t t)
+/* move a thread we own onto the suspend queue; runs directly (same scheduler)
+   or from the home scheduler's inbox drain for a cross-scheduler request */
+intern int pth_suspend_local(pth_t t)
 {
     pth_pqueue_t *q;
 
-    if (t == NULL)
-        return pth_error(FALSE, EINVAL);
-    if (t == pth_sched || t == pth_current)
+    if (t == pth_sched)
         return pth_error(FALSE, EPERM);
-    if (t->sched_home != pth_gsched_active)
-        return pth_error(FALSE, EPERM); /* no cross-scheduler suspend */
+    /* the thread may have terminated since a cross-scheduler request was
+       posted; pth_thread_exists() only compares queue node addresses, so it
+       is safe even if the TCB was freed */
+    if (!pth_thread_exists(t))
+        return pth_error(FALSE, ESRCH);
     switch (t->state) {
         case PTH_STATE_NEW:     q = &pth_NQ; break;
         case PTH_STATE_READY:   q = &pth_RQ; break;
@@ -669,17 +675,32 @@ int pth_suspend(pth_t t)
     return TRUE;
 }
 
-/* resume a previously suspended thread */
-int pth_resume(pth_t t)
+/* suspend a thread until its again manually resumed */
+int pth_suspend(pth_t t)
 {
-    pth_pqueue_t *q;
-
     if (t == NULL)
         return pth_error(FALSE, EINVAL);
     if (t == pth_sched || t == pth_current)
         return pth_error(FALSE, EPERM);
-    if (t->sched_home != pth_gsched_active)
-        return pth_error(FALSE, EPERM); /* no cross-scheduler resume */
+    if (t->sched_home != pth_gsched_active) {
+        /* cross-scheduler: hand the request to the target's home scheduler,
+           which owns its run queues. Carried out asynchronously (a request);
+           if the target is momentarily running on its scheduler it is back in
+           a queue by the time the message is drained. */
+        if (!pth_gsched_post(t->sched_home, PTH_GMSG_SUSPEND, t, NULL))
+            return pth_error(FALSE, EAGAIN);
+        return TRUE;
+    }
+    return pth_suspend_local(t);
+}
+
+/* move a thread we own off the suspend queue back to its live queue */
+intern int pth_resume_local(pth_t t)
+{
+    pth_pqueue_t *q;
+
+    if (t == pth_sched)
+        return pth_error(FALSE, EPERM);
     if (!pth_pqueue_contains(&pth_SQ, t))
         return pth_error(FALSE, EPERM);
     pth_pqueue_delete(&pth_SQ, t);
@@ -692,6 +713,38 @@ int pth_resume(pth_t t)
     pth_pqueue_insert(q, PTH_PRIO_STD, t);
     pth_debug2("pth_resume: resume thread \"%s\"\n", t->name);
     return TRUE;
+}
+
+/* resume a previously suspended thread */
+int pth_resume(pth_t t)
+{
+    if (t == NULL)
+        return pth_error(FALSE, EINVAL);
+    if (t == pth_sched || t == pth_current)
+        return pth_error(FALSE, EPERM);
+    if (t->sched_home != pth_gsched_active) {
+        if (!pth_gsched_post(t->sched_home, PTH_GMSG_RESUME, t, NULL))
+            return pth_error(FALSE, EAGAIN);
+        return TRUE;
+    }
+    return pth_resume_local(t);
+}
+
+/* yield-to hint applied on a thread's own scheduler (see pth_yield) */
+intern void pth_favor_local(pth_t t)
+{
+    pth_pqueue_t *q;
+
+    if (!pth_thread_exists(t))
+        return;
+    switch (t->state) {
+        case PTH_STATE_NEW:   q = &pth_NQ; break;
+        case PTH_STATE_READY: q = &pth_RQ; break;
+        default:              return;
+    }
+    if (pth_pqueue_contains(q, t))
+        pth_pqueue_favorite(q, t);
+    return;
 }
 
 /* switch a filedescriptor's I/O mode */

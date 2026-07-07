@@ -650,14 +650,17 @@ scheduler owns the target thread or primitive.
 * `pth_ctrl(PTH_CTRL_GETAVLOAD)` and `pth_ctrl(PTH_CTRL_FAVOURNEW)` are
   per-scheduler.
 
-### Cross-scheduler safe (added in phase 4, §16)
+### Cross-scheduler safe (added in phase 4, §16 and §18)
 * `pth_cancel` (deferred and asynchronous) and `pth_raise` — routed to the
-  target's home scheduler through the inbox.
+  target's home scheduler through the inbox (§16).
+* `pth_suspend`, `pth_resume`, and `pth_yield(target)` — likewise routed to the
+  target's home scheduler (§18). These are asynchronous *requests*; they take
+  effect at the target scheduler's next drain point (its next idle/block), so a
+  target that never yields to its own scheduler will not observe them promptly.
 
 ### Restricted across schedulers (return EPERM/EINVAL for a foreign target)
-* `pth_suspend`, `pth_resume`, and `pth_yield(specific_target)`. They mutate a
-  foreign TCB / run queues and would need the same inbox treatment; lower
-  priority (rarely used across schedulers).
+* (none remaining — all original thread-control verbs now work across
+  schedulers, subject to the asynchronous-delivery note above.)
 
 ### Scheduler-0-only / process-global (deliberately not M:N)
 * Signals — `PTH_EVENT_SIGS`, `pth_sigwait`, `pth_sigmask`: the signal
@@ -706,8 +709,8 @@ on one scheduler, async cancel of a napping thread on another, and a SIGUSR1
 raise to a `pth_sigwait` thread on a third — each verified through a
 cross-scheduler `pth_join`, under both the select and poll backends.
 
-With this, the only original thread-control verbs still pinned to one scheduler
-are `pth_suspend`/`pth_resume` and directed `pth_yield(target)` (§15).
+(`pth_suspend`/`pth_resume`/directed `pth_yield(target)` were the last verbs
+still pinned to one scheduler; they are lifted in §18.)
 
 
 ## 17. Design assessment: the wakeup substrate vs. other M:N runtimes
@@ -801,3 +804,48 @@ land. Natural next steps to close the gap, in increasing order of effort:
 wakeups, and ultimately some form of work-stealing / thread migration (by far
 the largest, as it breaks the single-owner invariant the rest of the design
 leans on).
+
+
+## 18. Phase 4: cross-scheduler pth_suspend / pth_resume / pth_yield(target)
+
+The last three thread-control verbs move a thread between its home scheduler's
+run queues (`pth_suspend`: live queue -> suspend queue; `pth_resume`: the
+reverse; `pth_yield(target)`: bump the target to the front of its ready/new
+queue). Like `pth_cancel`, the work is handed to the target's home scheduler
+through the inbox, with three new message kinds `PTH_GMSG_SUSPEND`,
+`PTH_GMSG_RESUME`, `PTH_GMSG_FAVOR`.
+
+* **Front ends / local workers.** `pth_suspend`/`pth_resume`/`pth_yield` keep
+  the classic path for a local target; for a foreign target they post the
+  request and return success. The bodies were extracted into
+  `pth_suspend_local()`, `pth_resume_local()` and `pth_favor_local()`, run
+  either directly or from the home scheduler's inbox drain. Each re-validates
+  the target with `pth_thread_exists()` before dereferencing it — that helper
+  only compares queue-node addresses, so it is safe even if the TCB was freed
+  between the request being posted and processed.
+* **`pth_yield(target)` cross-scheduler.** A thread on scheduler A cannot favour
+  a thread that runs on scheduler B, so the foreign case posts a `FAVOR` hint to
+  B (which bumps the target in its ready/new queue if still schedulable) and
+  then yields A's own scheduler, i.e. it degrades to `pth_yield(NULL)` plus a
+  remote hint.
+* **Suspending a waiting thread.** A thread parked on a sync primitive (in the
+  WQ) can be suspended: it moves WQ -> SQ while its pending event stays on the
+  TCB. A wakeup that arrives meanwhile just marks the event occurred; on
+  `pth_resume` the thread returns to the WQ and the event manager promotes it on
+  its next pass — identical to the single-scheduler behaviour.
+* **Asynchronous delivery.** These are requests carried out at the target
+  scheduler's next drain point (reached when its ready queue empties — i.e. when
+  it next goes idle or all its threads block). A momentarily-running target is
+  back in a queue by then, so the operation still applies; but a target that
+  spins without ever yielding to its scheduler will not observe the request
+  until it does. This is the same cooperative-latency property all the
+  cross-scheduler inbox operations share.
+
+`test_suspend_mp.c` suspends a worker looping on scheduler 1 from scheduler 0,
+asserts its progress counter freezes while suspended and advances again after
+`pth_resume`, and exercises a cross-scheduler `pth_yield(target)` — under both
+the select and poll backends.
+
+With this every original Pth thread-control verb operates across schedulers; the
+only remaining single-scheduler-bound facilities are process signals
+(`PTH_EVENT_SIGS`/`pth_sigwait`, scheduler-0 only) and `pth_fork` (§15).
