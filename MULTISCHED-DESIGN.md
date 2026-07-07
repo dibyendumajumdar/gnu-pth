@@ -579,3 +579,38 @@ Caveat: the `pthread_t == unsigned long` assumption and `dlsym(RTLD_NEXT)`
 symbol interposition target glibc/musl-style dynamic linking; fully static
 executables or platforms with a struct `pthread_t` would need a small porting
 shim.
+
+## 14. Phase 4: cross-scheduler message ports (§5 restriction lifted)
+
+Message ports (`pth_msg.c`) were documented in §5 as scheduler-0-only: the
+global registry ring and each port's `mp_queue` were unprotected, and
+`PTH_EVENT_MSG` is *polled* by the event manager rather than sitting on a
+directed-wakeup waiter queue, so a scheduler asleep in `poll(2)` would never
+notice a message arriving from another scheduler.
+
+The fix keeps the polled predicate (no waiter-queue rework needed) and adds
+two things:
+
+* **Locking.** A per-port spinlock (`mp_lock`) guards each `mp_queue`
+  (`put`/`get`/`pending` and the event-manager predicate read, in both the
+  select and poll backends); a global spinlock guards the registry ring
+  (`create`/`destroy`/`find`).
+* **Wakeup.** `pth_msgport_put()` appends under the lock, then calls
+  `pth_gsched_kick_others()`, which writes a byte to every *other* scheduler's
+  signal pipe. That breaks any scheduler sleeping in `poll(2)` out of its wait;
+  its next event-manager assembly pass re-reads the (now non-empty) port under
+  `mp_lock` and promotes the waiter. The kick carries no inbox message and is
+  idempotent — a spurious kick just costs one extra event-manager pass. The
+  ordering (append-before-kick, both after the lock is released) closes the
+  lost-wakeup window exactly as the mutex/cond path does.
+
+**Scheduler-0 robustness.** This exposed a latent assumption: scheduler 0
+treated an empty ready queue as a fatal "no more threads to schedule" error,
+whereas a kick can wake it with its only thread still parked on a port. The
+loop now waits (re-runs the event manager) whenever threads remain in the
+waiting/new/suspend queues, and only aborts when *all* queues are truly empty —
+which also hardens scheduler 0 against spurious signal-pipe wakeups in general.
+
+`test_msgport_mp.c`: a receiver on scheduler 0 drains a port fed by senders on
+schedulers 1..3; it checks the exact message count and a checksum, and passes
+under both the select and poll backends with no lost-wakeup hang.

@@ -286,6 +286,28 @@ intern int pth_gsched_wake(pth_gsched_t *g, pth_t t, pth_event_t ev)
 }
 
 /*
+ * Nudge every scheduler other than the caller's by writing a byte to its
+ * signal pipe, so a scheduler asleep in poll(2)/select(2) wakes up and
+ * re-evaluates its waiting threads. Used by pth_msgport_put(3): message
+ * ports are polled (not on a directed-wakeup waiter queue), so a remote
+ * put must break the target scheduler out of its sleep. No inbox message
+ * is posted; the wakeup byte alone triggers a fresh event-manager pass.
+ */
+intern void pth_gsched_kick_others(void)
+{
+#ifdef PTH_MP
+    pth_gsched_t *self = pth_gsched_active;
+    int i, n = pth_atomic_load(&pth_gsched_ntab);
+    for (i = 0; i < n; i++) {
+        pth_gsched_t *o = (i == 0) ? &pth_gsched_pri : pth_gsched_tab[i];
+        if (o != NULL && o != self)
+            pth_sc(write)(o->sigpipe[1], "m", 1);
+    }
+#endif
+    return;
+}
+
+/*
  * Drain the wakeup inbox: apply all pending messages. Returns TRUE if
  * any message was processed. Only ever runs in the scheduler's own OS
  * thread, so all thread/event/queue manipulation stays scheduler-local.
@@ -445,6 +467,19 @@ intern void *pth_scheduler(void *dummy)
                 continue;
             }
 #endif
+            /* The ready queue is empty. If threads are still parked waiting
+               for events (e.g. a cross-scheduler message-port arrival, which
+               only wakes us via a signal-pipe kick and is re-evaluated on the
+               event manager's next assembly pass), keep waiting instead of
+               treating this as a fatal condition. Only a truly empty set of
+               queues is an internal error. */
+            if (   pth_pqueue_elements(&g->WQ) > 0
+                || pth_pqueue_elements(&g->NQ) > 0
+                || pth_pqueue_elements(&g->SQ) > 0) {
+                pth_time_set(&snapshot, PTH_TIME_NOW);
+                pth_sched_eventmanager(&snapshot, FALSE /* wait */);
+                continue;
+            }
             fprintf(stderr, "**Pth** SCHEDULER INTERNAL ERROR: "
                             "no more thread(s) available to schedule!?!?\n");
             abort();
@@ -831,8 +866,12 @@ intern void pth_sched_eventmanager_poll(pth_time_t *now, int dopoll)
                 }
                 /* Message Port Arrivals */
                 else if (ev->ev_type == PTH_EVENT_MSG) {
+                    /* mp_queue is shared with cross-scheduler pth_msgport_put;
+                       read the predicate under the port's spinlock */
+                    pth_spin_lock(&ev->ev_args.MSG.mp->mp_lock);
                     if (pth_ring_elements(&(ev->ev_args.MSG.mp->mp_queue)) > 0)
                         this_occurred = TRUE;
+                    pth_spin_unlock(&ev->ev_args.MSG.mp->mp_lock);
                 }
                 /* Mutex Release and Condition Variable Signal events
                    are not polled anymore: threads park on the
@@ -1276,8 +1315,12 @@ intern void pth_sched_eventmanager_select(pth_time_t *now, int dopoll)
                 }
                 /* Message Port Arrivals */
                 else if (ev->ev_type == PTH_EVENT_MSG) {
+                    /* mp_queue is shared with cross-scheduler pth_msgport_put;
+                       read the predicate under the port's spinlock */
+                    pth_spin_lock(&ev->ev_args.MSG.mp->mp_lock);
                     if (pth_ring_elements(&(ev->ev_args.MSG.mp->mp_queue)) > 0)
                         this_occurred = TRUE;
+                    pth_spin_unlock(&ev->ev_args.MSG.mp->mp_lock);
                 }
                 /* Mutex Release and Condition Variable Signal events
                    are not polled anymore: threads park on the
