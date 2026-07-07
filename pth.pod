@@ -48,6 +48,14 @@ pth_kill,
 pth_ctrl,
 pth_version.
 
+=item B<Multi-Scheduler (M:N Threading)>
+
+pth_mp_init,
+pth_mp_shutdown,
+pth_spawn_on,
+pth_sched_count,
+pth_sched_id.
+
 =item B<Thread Attribute Handling>
 
 pth_attr_of,
@@ -580,6 +588,45 @@ scheduler's scope. If a thread is resumed, it is moved back to the queue
 from where it originally came and this way again enters the schedulers
 scope.
 
+=head2 Multi-Scheduler Threading (M:N)
+
+By default B<Pth> runs all threads on a single operating-system thread with a
+single cooperative scheduler, so threads never execute in parallel -- only one
+runs at any instant. When the library is built with multi-scheduler support
+(the C<PTH_MP> build option), an application may instead run I<N> independent
+schedulers, each on its own OS thread (pthread), so that up to I<N> B<Pth>
+threads run truly in parallel on a multiprocessor. This is an B<M:N> threading
+model: M lightweight B<Pth> threads are multiplexed onto N OS threads.
+
+Each scheduler owns a disjoint set of B<Pth> threads. A thread is created on a
+particular scheduler and never migrates: it lives and dies on its I<home>
+scheduler. Within one scheduler the classic cooperative, non-preemptive rules
+apply unchanged -- a thread runs until it blocks or yields. Between schedulers,
+threads run in parallel, so the usual data-race considerations apply to any
+memory they share, and the synchronization primitives below become the
+correct way to coordinate them.
+
+The synchronization objects (C<pth_mutex_t>, C<pth_cond_t>, C<pth_rwlock_t>,
+C<pth_barrier_t>), message ports, and C<pth_join>(3) all work across schedulers:
+a thread on one scheduler may lock a mutex held by, wait on a condition
+signalled by, or join a thread owned by another scheduler. The thread-control
+operations C<pth_cancel>, C<pth_raise>, C<pth_suspend>, C<pth_resume> and
+C<pth_yield>(I<target>) also work across schedulers, but as I<asynchronous
+requests>: they are delivered to the target's home scheduler and take effect at
+that scheduler's next scheduling point, not necessarily immediately.
+
+A few facilities remain confined to the first scheduler (scheduler 0, the one
+running the main thread): B<Pth>'s process-signal handling
+(C<PTH_EVENT_SIGS>/C<pth_sigwait>(3)) and C<pth_fork>(3). Threads that wait for
+process signals must therefore live on scheduler 0. Also note that
+C<pth_ctrl(PTH_CTRL_GETTHREADS)> and the load average report only the calling
+scheduler's threads under M:N, not a process-wide total.
+
+Applications that do not call C<pth_mp_init>(3) see no change: the single
+scheduler is scheduler 0 and everything behaves exactly as before. The library
+is source-compatible; only the layout of the public synchronization structures
+changed (so the version was bumped and clients must recompile).
+
 =head1 APPLICATION PROGRAMMING INTERFACE (API)
 
 In the following the B<Pth> I<Application Programming Interface> (API)
@@ -636,6 +683,11 @@ This returns the total number of threads currently in existence.  This query
 actually is formed out of the combination of queries for threads in a
 particular state, i.e., the C<PTH_CTRL_GETTHREADS> query is equal to the
 OR-combination of all the following specialized queries:
+
+Under B<M:N> multi-scheduler mode (see above) this and its specialized variants
+count only the threads belonging to the I<calling> scheduler, not a
+process-wide total; likewise C<PTH_CTRL_GETAVLOAD> reports the calling
+scheduler's load.
 
 C<PTH_CTRL_GETTHREADS_NEW> for the number of threads in the
 new queue (threads created via pth_spawn(3) but still not
@@ -702,6 +754,70 @@ steadily I<increasing>. The same value is also available under compile time as
 C<PTH_VERSION>.
 
 =back
+
+=head2 Multi-Scheduler Functions
+
+These functions control the optional B<M:N> multi-scheduler mode described
+above. They are always present, but in a library built without C<PTH_MP>
+support only a single scheduler exists: C<pth_mp_init> then accepts only the
+value C<1>, and the remaining functions report or operate on that one
+scheduler.
+
+=over 4
+
+=item int B<pth_mp_init>(int I<nschedulers>);
+
+This starts multi-scheduler mode with I<nschedulers> independent schedulers,
+each running on its own OS thread, and must be called (once) from the main
+thread after C<pth_init>(3) (or in place of the implicit initialization).
+C<pth_init()> is equivalent to C<pth_mp_init(1)>. Scheduler 0 is the calling
+(main) thread's scheduler; the other I<nschedulers>-1 are created as new OS
+threads. It returns C<TRUE> on success and C<FALSE> with C<errno> set on error
+(C<EINVAL> for an out-of-range count, C<EPERM> if not called from the primary
+scheduler, C<ENOSYS> if the library was built without C<PTH_MP> and
+I<nschedulers> is not 1).
+
+=item int B<pth_mp_shutdown>(void);
+
+This stops the auxiliary schedulers started by C<pth_mp_init>(3) and returns to
+single-scheduler operation. It must be called from the main thread (scheduler
+0). Ensure the threads running on the auxiliary schedulers have terminated (or
+will terminate) first; the call waits cooperatively until every auxiliary
+scheduler has run dry, then reaps its OS thread. It returns C<TRUE> on success.
+
+=item pth_t B<pth_spawn_on>(int I<sched_id>, pth_attr_t I<attr>, void *(*I<entry>)(void *), void *I<arg>);
+
+This is like C<pth_spawn>(3) but places the new thread on the scheduler
+identified by I<sched_id> (C<0> .. C<pth_sched_count()>-1) instead of the
+caller's scheduler. The thread's home scheduler is fixed for its lifetime.
+Plain C<pth_spawn>(3) always creates the thread on the I<caller's> scheduler.
+Returns the new thread handle, or C<NULL> with C<errno> set on error.
+
+=item int B<pth_sched_count>(void);
+
+This returns the number of schedulers currently running (C<1> in
+single-scheduler mode, or the value established by C<pth_mp_init>(3)).
+
+=item int B<pth_sched_id>(void);
+
+This returns the identifier (C<0>-based) of the scheduler on which the calling
+thread is running.
+
+=back
+
+B<Cross-scheduler operation semantics.> Under M:N the synchronization objects
+(C<pth_mutex_t>, C<pth_cond_t>, C<pth_rwlock_t>, C<pth_barrier_t>), message
+ports, and C<pth_join>(3) operate correctly regardless of which scheduler owns
+the thread or object involved. The thread-control operations C<pth_cancel>(3),
+C<pth_raise>(3), C<pth_suspend>(3), C<pth_resume>(3) and
+C<pth_yield>(I<target>) additionally work when the target thread belongs to
+another scheduler, but there they behave as I<asynchronous requests>: the
+operation is forwarded to the target's home scheduler and applied at that
+scheduler's next scheduling point (when it next becomes idle or its threads
+block), rather than synchronously on return. A target that spins without ever
+yielding to its own scheduler will therefore not observe the request promptly.
+This matches C<pthread_cancel>(3) request semantics and, for a I<detached>
+target that may already have exited, is inherently racy just as in POSIX.
 
 =head2 Thread Attribute Handling
 
@@ -884,6 +1000,10 @@ pth_exit(3). So the thread can also exit by just returning. Nevertheless
 the thread can also exit explicitly at any time by calling pth_exit(3). But
 keep in mind that calling the POSIX function exit(3) still terminates the
 complete process and not just the current thread.
+
+Under B<M:N> multi-scheduler mode the new thread is created on the I<caller's>
+scheduler and never migrates from it; use C<pth_spawn_on>(3) to place it on a
+specific scheduler instead.
 
 There is no B<Pth>-internal limit on the number of threads one can spawn,
 except the limit implied by the available virtual memory. B<Pth> internally
@@ -1293,7 +1413,10 @@ This retrieves the value under I<key>.
 =head2 Message Port Communication
 
 The following functions provide message ports which can be used for efficient
-and flexible inter-thread communication.
+and flexible inter-thread communication. Under B<M:N> multi-scheduler mode they
+are safe to use across schedulers: a thread on one scheduler may
+pth_msgport_put(3) to a port that a thread on another scheduler is waiting on
+(the waiting thread is woken on its own scheduler).
 
 =over 4
 
@@ -1762,6 +1885,10 @@ the pth_sigwait() call. The trick and noticeable point here is that this way
 you get an asynchronous aware application that is written completely
 synchronously. When you think about the problem of I<asynchronous safe>
 functions you should recognize that this is a great benefit.
+
+Under B<M:N> multi-scheduler mode, B<Pth>'s process-signal handling lives on
+scheduler 0 only; a thread that calls pth_sigwait(3) (or otherwise waits on
+C<PTH_EVENT_SIGS>) must therefore run on scheduler 0.
 
 =item int B<pth_connect>(int I<s>, const struct sockaddr *I<addr>, socklen_t I<addrlen>);
 
@@ -2335,6 +2462,16 @@ C<--enable-debug> option), i.e., not only stub functions remain [see
 C<pth_debug.c> for details].
 
 =head1 RESTRICTIONS
+
+Under B<M:N> multi-scheduler mode (C<pth_mp_init>(3)) a few facilities remain
+tied to the first scheduler (scheduler 0, which runs the main thread):
+B<Pth>'s process-signal handling (C<PTH_EVENT_SIGS>, C<pth_sigwait>(3)) and
+C<pth_fork>(3); threads that use these must run on scheduler 0. Cross-scheduler
+C<pth_cancel>/C<pth_raise>/C<pth_suspend>/C<pth_resume>/C<pth_yield>(I<target>)
+are applied asynchronously at the target scheduler's next scheduling point.
+C<pth_ctrl(PTH_CTRL_GETTHREADS)> and the load average are per-scheduler. The
+public synchronization structure layouts changed for M:N support, so clients
+must be recompiled against this version (the API remains source-compatible).
 
 B<Pth> (intentionally) provides no replacements for non-thread-safe
 functions (like strtok(3) which uses a static internal buffer) or
