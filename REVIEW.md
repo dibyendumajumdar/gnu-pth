@@ -184,3 +184,41 @@ that no other thread will touch it). See the lifetime notes added to
 `pth_msgport_destroy(3)`/`pth_msgport_find(3)` in pth.pod. `test_msgport_mp.c`
 already exercises the safe cross-scheduler pattern (owner keeps the port alive
 across all senders, destroys only after they finish).
+
+---
+
+## Second Follow-up Review: Open Findings
+
+### High: `pthread_once()` can hang forever if `init_routine()` is cancelled
+
+`pthread_once()` (`pthread.c`) now changes the once control from `0` to `1`
+before calling `init_routine()`, and only publishes `2` after the routine
+returns. If the routine reaches a cancellation point and is cancelled, the
+control word remains stuck at `1`; later callers spin/yield forever waiting for
+state `2`.
+
+This regresses the documented POSIX behavior in `pthread.pod`: cancellation
+inside `init_routine()` should leave the control as if `pthread_once()` was
+never called. The same stuck-in-progress risk exists for `pth_once()` if its
+constructor exits non-locally via Pth cancellation/exit. A cleanup handler
+around the initializer should reset `1 -> 0` on cancellation/non-completion,
+while normal completion publishes `2`.
+
+### Low: checked-in `pth.3` has stale message-port lifetime documentation
+
+The new message-port lifetime contract is present in `pth.pod`, but the
+checked-in `pth.3` still has the old short `pth_msgport_destroy()` /
+`pth_msgport_find()` text. Since `pth.3` is present in the tree and install
+paths reference generated manpages, this can ship stale documentation unless
+the manpage is regenerated.
+
+### Second Follow-up Verification Performed
+
+A fresh default CMake configure in `/tmp/gnu-pth-default-review` confirmed the
+new defaults: `PTH_MP=ON` and `PTH_SCHED_POLL=ON`. The fresh build completed
+successfully and `ctest --test-dir /tmp/gnu-pth-default-review
+--output-on-failure` passed all 13 registered tests, including the MP and
+poll-related tests: `test_mpsched`, `test_mutexfair_mp`, `test_join_mp`,
+`test_msgport_mp`, `test_cancelraise_mp`, `test_suspend_mp`,
+`test_cancelblock_mp`, and `test_once_mp`.
+
