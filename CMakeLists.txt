@@ -24,6 +24,7 @@ option(PTH_DEBUG         "Enable Pth debugging"                       OFF)
 option(PTH_SYSCALL_SOFT  "Enable soft system call mapping"            OFF)
 option(PTH_SYSCALL_HARD  "Enable hard system call mapping"            OFF)
 option(PTH_MP            "Enable multi-scheduler (multi-CPU) support" OFF)
+option(PTH_SCHED_POLL   "Use poll(2) not select(2) in the scheduler core (no FD_SETSIZE ceiling)" OFF)
 # BUILD_SHARED_LIBS selects static (default) vs shared library
 
 # mctx overrides (equivalent to --with-mctx-mth/dsp/stk); empty = autodetect
@@ -427,6 +428,9 @@ if(PTH_MP)
     target_compile_definitions(pth PUBLIC PTH_MP)
     target_link_libraries(pth PUBLIC Threads::Threads)
 endif()
+if(PTH_SCHED_POLL)
+    target_compile_definitions(pth PRIVATE PTH_SCHED_POLL)
+endif()
 set_target_properties(pth PROPERTIES
     VERSION "${PTH_VERSION_SHORT}"
     POSITION_INDEPENDENT_CODE ON)
@@ -440,6 +444,9 @@ if(PTH_BUILD_PTHREAD)
         target_compile_definitions(pth_pthread PUBLIC PTH_MP)
         target_link_libraries(pth_pthread PUBLIC Threads::Threads)
     endif()
+    if(PTH_SCHED_POLL)
+        target_compile_definitions(pth_pthread PRIVATE PTH_SCHED_POLL)
+    endif()
     set_target_properties(pth_pthread PROPERTIES
         OUTPUT_NAME pthread
         VERSION "${PTH_VERSION_SHORT}"
@@ -450,7 +457,7 @@ endif()
 if(PTH_BUILD_TESTS)
     enable_testing()
     foreach(t test_std test_mp test_misc test_philo test_sig
-              test_select test_httpd test_uctx test_sync test_mutexfair)
+              test_select test_httpd test_uctx test_sync test_mutexfair test_pollfd)
         add_executable(${t} ${t}.c test_common.c)
         target_link_libraries(${t} PRIVATE pth)
     endforeach()
@@ -460,7 +467,7 @@ if(PTH_BUILD_TESTS)
     endif()
     # Only test_std and test_uctx are self-terminating, non-interactive tests;
     # the others (mp, sig, philo, misc, select, httpd) are interactive demos.
-    foreach(t test_std test_uctx test_sync test_mutexfair)
+    foreach(t test_std test_uctx test_sync test_mutexfair test_pollfd)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()

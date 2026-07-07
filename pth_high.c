@@ -34,6 +34,9 @@
  */
 
 #include "pth_p.h"
+#ifdef PTH_SCHED_POLL
+#include <poll.h>
+#endif
 
 /* Pth variant of nanosleep(2) */
 int pth_nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
@@ -740,12 +743,21 @@ ssize_t pth_read_ev(int fd, void *buf, size_t nbytes, pth_event_t ev_extra)
         /* now directly poll filedescriptor for readability
            to avoid unneccessary (and resource consuming because of context
            switches, etc) event handling through the scheduler */
+#ifdef PTH_SCHED_POLL
+        (void)delay; (void)fds;   /* poll(2): no FD_SETSIZE ceiling on fd value */
+        {
+            struct pollfd _pfd;
+            _pfd.fd = fd; _pfd.events = POLLIN; _pfd.revents = 0;
+            while ((n = pth_sc(poll)(&_pfd, 1, 0)) < 0 && errno == EINTR) ;
+        }
+#else
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
         delay.tv_sec  = 0;
         delay.tv_usec = 0;
         while ((n = pth_sc(select)(fd+1, &fds, NULL, NULL, &delay)) < 0
                && errno == EINTR) ;
+#endif
         if (n < 0 && (errno == EINVAL || errno == EBADF))
             return pth_error(-1, errno);
 
@@ -813,12 +825,21 @@ ssize_t pth_write_ev(int fd, const void *buf, size_t nbytes, pth_event_t ev_extr
         /* now directly poll filedescriptor for writeability
            to avoid unneccessary (and resource consuming because of context
            switches, etc) event handling through the scheduler */
+#ifdef PTH_SCHED_POLL
+        (void)delay; (void)fds;   /* poll(2): no FD_SETSIZE ceiling on fd value */
+        {
+            struct pollfd _pfd;
+            _pfd.fd = fd; _pfd.events = POLLOUT; _pfd.revents = 0;
+            while ((n = pth_sc(poll)(&_pfd, 1, 0)) < 0 && errno == EINTR) ;
+        }
+#else
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
         delay.tv_sec  = 0;
         delay.tv_usec = 0;
         while ((n = pth_sc(select)(fd+1, NULL, &fds, NULL, &delay)) < 0
                && errno == EINTR) ;
+#endif
         if (n < 0 && (errno == EINVAL || errno == EBADF))
             return pth_error(-1, errno);
 
@@ -912,12 +933,21 @@ ssize_t pth_readv_ev(int fd, const struct iovec *iov, int iovcnt, pth_event_t ev
         /* first directly poll filedescriptor for readability
            to avoid unneccessary (and resource consuming because of context
            switches, etc) event handling through the scheduler */
+#ifdef PTH_SCHED_POLL
+        (void)delay; (void)fds;   /* poll(2): no FD_SETSIZE ceiling on fd value */
+        {
+            struct pollfd _pfd;
+            _pfd.fd = fd; _pfd.events = POLLIN; _pfd.revents = 0;
+            while ((n = pth_sc(poll)(&_pfd, 1, 0)) < 0 && errno == EINTR) ;
+        }
+#else
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
         delay.tv_sec  = 0;
         delay.tv_usec = 0;
         while ((n = pth_sc(select)(fd+1, &fds, NULL, NULL, &delay)) < 0
                && errno == EINTR) ;
+#endif
 
         /* if filedescriptor is still not readable,
            let thread sleep until it is or event occurs */
@@ -1057,12 +1087,21 @@ ssize_t pth_writev_ev(int fd, const struct iovec *iov, int iovcnt, pth_event_t e
         /* first directly poll filedescriptor for writeability
            to avoid unneccessary (and resource consuming because of context
            switches, etc) event handling through the scheduler */
+#ifdef PTH_SCHED_POLL
+        (void)delay; (void)fds;   /* poll(2): no FD_SETSIZE ceiling on fd value */
+        {
+            struct pollfd _pfd;
+            _pfd.fd = fd; _pfd.events = POLLOUT; _pfd.revents = 0;
+            while ((n = pth_sc(poll)(&_pfd, 1, 0)) < 0 && errno == EINTR) ;
+        }
+#else
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
         delay.tv_sec  = 0;
         delay.tv_usec = 0;
         while ((n = pth_sc(select)(fd+1, NULL, &fds, NULL, &delay)) < 0
                && errno == EINTR) ;
+#endif
 
         for (;;) {
             /* if filedescriptor is still not writeable,
@@ -1343,12 +1382,21 @@ ssize_t pth_recvfrom_ev(int fd, void *buf, size_t nbytes, int flags, struct sock
            switches, etc) event handling through the scheduler */
         if (!pth_util_fd_valid(fd))
             return pth_error(-1, EBADF);
+#ifdef PTH_SCHED_POLL
+        (void)delay; (void)fds;   /* poll(2): no FD_SETSIZE ceiling on fd value */
+        {
+            struct pollfd _pfd;
+            _pfd.fd = fd; _pfd.events = POLLIN; _pfd.revents = 0;
+            while ((n = pth_sc(poll)(&_pfd, 1, 0)) < 0 && errno == EINTR) ;
+        }
+#else
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
         delay.tv_sec  = 0;
         delay.tv_usec = 0;
         while ((n = pth_sc(select)(fd+1, &fds, NULL, NULL, &delay)) < 0
                && errno == EINTR) ;
+#endif
         if (n < 0 && (errno == EINVAL || errno == EBADF))
             return pth_error(-1, errno);
 
@@ -1432,12 +1480,21 @@ ssize_t pth_sendto_ev(int fd, const void *buf, size_t nbytes, int flags, const s
             pth_fdmode(fd, fdmode);
             return pth_error(-1, EBADF);
         }
+#ifdef PTH_SCHED_POLL
+        (void)delay; (void)fds;   /* poll(2): no FD_SETSIZE ceiling on fd value */
+        {
+            struct pollfd _pfd;
+            _pfd.fd = fd; _pfd.events = POLLOUT; _pfd.revents = 0;
+            while ((n = pth_sc(poll)(&_pfd, 1, 0)) < 0 && errno == EINTR) ;
+        }
+#else
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
         delay.tv_sec  = 0;
         delay.tv_usec = 0;
         while ((n = pth_sc(select)(fd+1, NULL, &fds, NULL, &delay)) < 0
                && errno == EINTR) ;
+#endif
         if (n < 0 && (errno == EINVAL || errno == EBADF))
             return pth_error(-1, errno);
 

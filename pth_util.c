@@ -94,8 +94,14 @@ intern char *pth_util_cpystrn(char *dst, const char *src, size_t dst_size)
 /* check whether a file-descriptor is valid */
 intern int pth_util_fd_valid(int fd)
 {
-    if (fd < 0 || fd >= FD_SETSIZE)
+    if (fd < 0)
         return FALSE;
+#ifndef PTH_SCHED_POLL
+    /* the classic select(2) core cannot represent fds >= FD_SETSIZE;
+       the poll(2) core (PTH_SCHED_POLL) has no such ceiling */
+    if (fd >= FD_SETSIZE)
+        return FALSE;
+#endif
     if (fcntl(fd, F_GETFL) == -1 && errno == EBADF)
         return FALSE;
     return TRUE;

@@ -496,3 +496,42 @@ finds the TCB in the DQ. Same-scheduler `pth_join` and `pth_join(NULL)`
 (join-any) are unchanged. Constraint (unchanged from classic Pth): a thread
 must have a single joiner, and a cross-scheduler-joined thread must not also
 be subject to join-any on its home scheduler.
+
+## 12. Prototype: poll(2) scheduler core (opt-in, `PTH_SCHED_POLL`)
+
+`select(2)`/`fd_set` imposes a hard `FD_SETSIZE` (typically 1024) ceiling on
+descriptor *values*: `FD_SET(fd, …)` with `fd >= FD_SETSIZE` corrupts memory,
+so Pth defensively rejects such fds in `pth_util_fd_valid()`. The per-scheduler
+split (§9.5) relieves the fd *count* each scheduler scans but not this ceiling,
+since fd values are process-global.
+
+An opt-in `poll(2)` backend removes the ceiling. Built with
+`-DPTH_SCHED_POLL` (CMake: `-DPTH_SCHED_POLL=ON`); the default build is the
+unchanged `select(2)` path. Three layers change, all behind the flag:
+
+* **Scheduler core** (`pth_sched.c`). `pth_sched_eventmanager()` becomes a thin
+  dispatcher to `pth_sched_eventmanager_poll()` (poll) or the original
+  `pth_sched_eventmanager_select()`. The poll variant assembles a grow-on-demand
+  `struct pollfd` vector (single-fd `PTH_EVENT_FD` events, plus each set fd of a
+  `PTH_EVENT_SELECT` event, plus the self-pipe), blocks in `poll()`, and reads
+  readiness from `revents`. `POLLNVAL` pinpoints bad descriptors directly,
+  replacing select's per-fd error re-probe.
+* **I/O wrappers** (`pth_high.c`). The "fast-poll before parking" step in the
+  six `pth_{read,readv,recv,write,writev,send}_ev` paths uses a one-entry
+  `poll()` instead of `FD_SET`+`select`.
+* **Validation** (`pth_util.c`). `pth_util_fd_valid()` drops the
+  `fd >= FD_SETSIZE` rejection.
+
+`PTH_EVENT_SELECT` (from `pth_select`) keeps `fd_set` semantics at the API
+boundary (its `nfd` is `<= FD_SETSIZE` by contract); the poll core synthesises
+its readiness `fd_set`s from `revents`, which is safe within that bound. Test
+`test_pollfd.c` exercises the FD path, the SELECT path, and a descriptor above
+`FD_SETSIZE` (passes under `PTH_SCHED_POLL`, cleanly skipped otherwise). The
+full suite passes on the poll backend in both single-scheduler and MP builds.
+
+Not yet converted (same pattern, straightforward follow-ups): the `connect`/
+`accept` fast-polls, the reusable pollfd vector is currently reallocated per
+pass rather than cached on the scheduler struct, and the millisecond timeout
+granularity of `poll()` is coarser than select's microseconds (rounded up, so
+never a busy-spin). A stateful `epoll`/`kqueue` backend behind the same
+dispatcher remains the scalable end goal (§ discussion).
