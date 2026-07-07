@@ -109,3 +109,44 @@ build. The full MP test suite (`test_mpsched`, `test_join_mp`,
 `test_cancelblock_mp`) plus `test_std` / `test_sync` all pass; the new
 `test_cancelblock_mp` was also confirmed to fail (core dump) against a build
 with fix #1 reverted, demonstrating it actually catches the regression.
+
+---
+
+## Follow-up Review: Open Findings
+
+### High: `pth_once()` / `pthread_once()` are not MP-safe
+
+`pth_once()` (`pth_lib.c`) and `pthread_once()` (`pthread.c`) still use the
+classic unsynchronized check-then-set implementation on an integer once control.
+Under M:N scheduling, two OS-backed schedulers can concurrently observe the
+control value as unset and both run the initializer. This is both a data race
+and a violation of the expected once-only semantics.
+
+This likely needs an atomic state machine such as UNINIT / IN_PROGRESS / DONE,
+where the winning scheduler runs the initializer and other schedulers wait or
+yield until the state reaches DONE. Holding a spinlock while executing the user
+initializer would be unsafe because the initializer can call back into Pth or
+block cooperatively.
+
+### Medium: named message-port lookup has a cross-scheduler lifetime race
+
+The message-port registry ring is now protected while inserting, removing and
+searching (`pth_msg.c`), but `pth_msgport_find()` returns a raw `pth_msgport_t`
+after dropping `pth_msgport_lock`. Another scheduler can then call
+`pth_msgport_destroy()` and free that port before the finder uses it in
+`pth_msgport_put()`, `pth_msgport_pending()` or `pth_msgport_get()`.
+
+The ring lock fixes traversal corruption, but it does not protect the lifetime
+of the returned port object. This needs either a reference/lifetime protocol,
+deferred destruction on the owning scheduler, or clearly documented external
+lifetime rules with tests that cover cross-scheduler find/destroy races.
+
+### Follow-up Verification Performed
+
+On the local Linux build directory, `cmake --build build -j2` completed
+successfully. `ctest --test-dir build --output-on-failure` passed for the
+registered tests in that build (`test_std`, `test_uctx`, `test_sync`,
+`test_mpsched`). The MP regression binaries were also run directly and passed:
+`test_join_mp`, `test_cancelblock_mp`, `test_cancelraise_mp`,
+`test_suspend_mp`, `test_msgport_mp`, and `test_mutexfair_mp`.
+
