@@ -381,6 +381,23 @@ pth_t pth_self(void)
     return pth_current;
 }
 
+/* record a per-thread raised signal on the thread's home scheduler; runs
+   either directly (same-scheduler pth_raise) or from the home scheduler's
+   inbox drain for a cross-scheduler request. The event manager promotes a
+   thread waiting on PTH_EVENT_SIGS once its sigpending set changes. */
+intern void pth_raise_local(pth_t t, int sig)
+{
+    if (!pth_thread_exists(t))
+        return;
+    if (t->state == PTH_STATE_DEAD)
+        return;
+    if (!sigismember(&t->sigpending, sig)) {
+        sigaddset(&t->sigpending, sig);
+        t->sigpendcnt++;
+    }
+    return;
+}
+
 /* raise a signal for a thread */
 int pth_raise(pth_t t, int sig)
 {
@@ -388,8 +405,16 @@ int pth_raise(pth_t t, int sig)
 
     if (t == NULL || t == pth_current || (sig < 0 || sig > PTH_NSIG))
         return pth_error(FALSE, EINVAL);
-    if (t->sched_home != pth_gsched_active)
-        return pth_error(FALSE, EPERM); /* no cross-scheduler raise */
+    if (t->sched_home != pth_gsched_active) {
+        /* cross-scheduler: deliver through the target's home scheduler */
+        if (sig == 0)
+            return TRUE; /* existence test: caller holds a live handle */
+        if (sigaction(sig, NULL, &sa) == 0 && sa.sa_handler == SIG_IGN)
+            return TRUE; /* globally ignored: nothing to do */
+        if (!pth_gsched_post_raise(t->sched_home, t, sig))
+            return pth_error(FALSE, EAGAIN);
+        return TRUE;
+    }
     if (sig == 0)
         /* just test whether thread exists */
         return pth_thread_exists(t);

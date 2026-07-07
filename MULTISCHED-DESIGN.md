@@ -614,3 +614,91 @@ which also hardens scheduler 0 against spurious signal-pipe wakeups in general.
 `test_msgport_mp.c`: a receiver on scheduler 0 drains a port fed by senders on
 schedulers 1..3; it checks the exact message count and a checksum, and passes
 under both the select and poll backends with no lost-wakeup hang.
+
+## 15. API compatibility status under M:N (as of phase 4 in progress)
+
+A map of the original single-scheduler API against the current multi-scheduler
+(M:N) build. "Cross-scheduler safe" means the call works regardless of which
+scheduler owns the target thread or primitive.
+
+### Fully cross-scheduler safe
+* Synchronization: `pth_mutex_*` (including the `PTH_MUTEX_FAIR` handoff mode),
+  `pth_cond_*`, `pth_rwlock_*`, `pth_barrier_*` — spinlock-guarded state with
+  directed wakeups through the target's home-scheduler inbox.
+* `pth_join(tid)` on a specific thread (§11); `pth_join(NULL)` join-any remains
+  local (reaps only the calling scheduler's dead queue).
+* Message ports `pth_msgport_*` / `PTH_EVENT_MSG` (§14).
+* `pth_spawn` (caller's scheduler) and `pth_spawn_on` (chosen scheduler).
+* Thread-specific data `pth_key_*` — process-global key table under a spinlock
+  (`pth_data.c`); per-thread values live in the TCB.
+* Per-thread `errno`; fd / `select` / timer events (`PTH_EVENT_FD`,
+  `PTH_EVENT_SELECT`, `PTH_EVENT_TIME`) — each scheduler runs its own event
+  loop, no cross-scheduler coordination needed.
+* `pth_self`, `pth_sched_id`, `pth_sched_count`, `pth_yield(NULL)`.
+
+### Works, but scoped to the calling scheduler (semantics changed)
+* `pth_ctrl(PTH_CTRL_GETTHREADS…)` counts only the calling scheduler's queues
+  (the `pth_NQ`/`pth_RQ`/… macros resolve to `pth_gsched_active->…`). There is
+  no process-wide total; a `PTH_CTRL_GETTHREADS_ALL` summing per-scheduler
+  counters is a candidate addition.
+* `pth_ctrl(PTH_CTRL_GETAVLOAD)` and `pth_ctrl(PTH_CTRL_FAVOURNEW)` are
+  per-scheduler.
+
+### Cross-scheduler safe (added in phase 4, §16)
+* `pth_cancel` (deferred and asynchronous) and `pth_raise` — routed to the
+  target's home scheduler through the inbox.
+
+### Restricted across schedulers (return EPERM/EINVAL for a foreign target)
+* `pth_suspend`, `pth_resume`, and `pth_yield(specific_target)`. They mutate a
+  foreign TCB / run queues and would need the same inbox treatment; lower
+  priority (rarely used across schedulers).
+
+### Scheduler-0-only / process-global (deliberately not M:N)
+* Signals — `PTH_EVENT_SIGS`, `pth_sigwait`, `pth_sigmask`: the signal
+  machinery is scheduler-0 business; auxiliary schedulers run with all signals
+  blocked, so signal-waiting threads must live on scheduler 0.
+* `pth_fork` — fork + MP is out of scope.
+
+
+## 16. Phase 4: cross-scheduler pth_cancel and pth_raise
+
+`pth_cancel` and `pth_raise` mutate the target thread's TCB and its home
+scheduler's run queues, so — like `pth_join` and message ports — the work is
+handed to the target's home scheduler through the wakeup inbox. Two new message
+kinds carry the request: `PTH_GMSG_CANCEL` and `PTH_GMSG_RAISE` (the latter
+also carries a signal number in a new `sig` field of the inbox message).
+
+* **Front ends.** `pth_cancel`/`pth_raise` keep the classic behaviour when the
+  target is local. For a foreign target (`sched_home != pth_gsched_active`, a
+  read that is always safe since `sched_home` is immutable) they post the
+  request and return success — a *request*, carried out asynchronously, exactly
+  as `pthread_cancel(3)` specifies. Globally-ignored signals and `sig == 0`
+  existence tests are short-circuited on the caller side.
+* **Local workers.** The bodies were extracted into `pth_cancel_local()` and
+  `pth_raise_local()`, run either directly (local call) or from the home
+  scheduler's inbox drain. Each first re-validates the target with
+  `pth_thread_exists()` (it may have terminated — and, if detached, been freed
+  — between posting and processing; for a detached target this remains
+  inherently racy, as in POSIX).
+* **Deferred vs async cancel.** Deferred cancellation just sets `cancelreq`;
+  the target's own scheduler promotes it (the event manager already treats
+  `cancelreq` as an occurred event) and it exits at its next cancellation point
+  through the normal death path. Asynchronous cancellation reaps the target
+  in place; that path was extended to also publish death on the TCB and wake
+  any cross-scheduler joiners (`join_done` + `join_waitq`), mirroring the
+  scheduler's normal death block — without which a remote `pth_join()` of an
+  async-cancelled thread would hang.
+* **Raise.** `pth_raise_local()` sets the per-thread pending signal; a target
+  parked on `PTH_EVENT_SIGS` is promoted by the event manager's next pass. This
+  uses the per-thread `sigpending` bitmap (not OS signals), so it works on
+  auxiliary schedulers even though process-signal machinery stays on
+  scheduler 0. Unlike the local path it does not force the target to run
+  immediately; delivery is "soon", at the home scheduler's next loop.
+
+`test_cancelraise_mp.c` covers all three: deferred cancel of a looping thread
+on one scheduler, async cancel of a napping thread on another, and a SIGUSR1
+raise to a `pth_sigwait` thread on a third — each verified through a
+cross-scheduler `pth_join`, under both the select and poll backends.
+
+With this, the only original thread-control verbs still pinned to one scheduler
+are `pth_suspend`/`pth_resume` and directed `pth_yield(target)` (§15).

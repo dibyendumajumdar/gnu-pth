@@ -149,11 +149,14 @@ struct pth_gmsg_st {
     int                 kind;   /* PTH_GMSG_*                             */
     pth_t               thread; /* subject thread                         */
     pth_event_t         event;  /* PTH_GMSG_WAKE: event to mark occurred  */
+    int                 sig;    /* PTH_GMSG_RAISE: signal number          */
 };
-#define PTH_GMSG_WAKE  1
-#define PTH_GMSG_SPAWN 2
-#define PTH_GMSG_STOP  3
-#define PTH_GMSG_REAP  4
+#define PTH_GMSG_WAKE   1
+#define PTH_GMSG_SPAWN  2
+#define PTH_GMSG_STOP   3
+#define PTH_GMSG_REAP   4
+#define PTH_GMSG_CANCEL 5
+#define PTH_GMSG_RAISE  6
 
 #endif /* cpp */
 
@@ -271,6 +274,7 @@ intern int pth_gsched_post(pth_gsched_t *g, int kind, pth_t t, pth_event_t ev)
     m->kind   = kind;
     m->thread = t;
     m->event  = ev;
+    m->sig    = 0;
     do {
         head = g->inbox;
         m->next = (pth_gmsg_t *)head;
@@ -283,6 +287,27 @@ intern int pth_gsched_post(pth_gsched_t *g, int kind, pth_t t, pth_event_t ev)
 intern int pth_gsched_wake(pth_gsched_t *g, pth_t t, pth_event_t ev)
 {
     return pth_gsched_post(g, PTH_GMSG_WAKE, t, ev);
+}
+
+/* like pth_gsched_post but carries a signal number for PTH_GMSG_RAISE */
+intern int pth_gsched_post_raise(pth_gsched_t *g, pth_t t, int sig)
+{
+    pth_gmsg_t *m;
+    void *head;
+
+    if ((m = (pth_gmsg_t *)malloc(sizeof(pth_gmsg_t))) == NULL)
+        return FALSE;
+    m->kind   = PTH_GMSG_RAISE;
+    m->thread = t;
+    m->event  = NULL;
+    m->sig    = sig;
+    do {
+        head = g->inbox;
+        m->next = (pth_gmsg_t *)head;
+    } while (!pth_atomic_ptr_cas(&g->inbox, head, m));
+    if (g != pth_gsched_active)
+        pth_sc(write)(g->sigpipe[1], "!", 1);
+    return TRUE;
 }
 
 /*
@@ -360,6 +385,15 @@ intern int pth_gsched_drain(pth_gsched_t *g)
                processed, so it is always found here. */
             pth_pqueue_delete(&g->DQ, rev->thread);
             pth_tcb_free(rev->thread);
+        }
+        else if (rev->kind == PTH_GMSG_CANCEL) {
+            /* carry out a cross-scheduler cancellation locally: we own this
+               thread's TCB and run queues (see pth_cancel.c) */
+            (void)pth_cancel_local(rev->thread);
+        }
+        else if (rev->kind == PTH_GMSG_RAISE) {
+            /* deliver a cross-scheduler raised signal locally (see pth_lib.c) */
+            pth_raise_local(rev->thread, rev->sig);
         }
         free(rev);
         any = TRUE;

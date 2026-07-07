@@ -50,24 +50,20 @@ void pth_cancel_point(void)
     return;
 }
 
-/* cancel a thread (the friendly way) */
-int pth_cancel(pth_t thread)
+/* carry out the actual cancellation on the thread's home scheduler. Runs
+   either directly (same-scheduler pth_cancel) or from the home scheduler's
+   inbox drain for a cross-scheduler request. All queue/TCB mutation stays
+   local to the owning scheduler. */
+intern int pth_cancel_local(pth_t thread)
 {
     pth_pqueue_t *q;
 
-    if (thread == NULL)
-        return pth_error(FALSE, EINVAL);
-
-    /* the current thread cannot be cancelled */
-    if (thread == pth_current)
-        return pth_error(FALSE, EINVAL);
-
-    /* the thread has to be at least still alive */
+    /* the thread may have terminated (and, if detached, been freed) between
+       a cross-scheduler request being posted and processed here: validate it
+       still lives on this scheduler before touching it */
+    if (!pth_thread_exists(thread))
+        return pth_error(FALSE, ESRCH);
     if (thread->state == PTH_STATE_DEAD)
-        return pth_error(FALSE, EPERM);
-
-    /* no cross-scheduler cancellation (yet) */
-    if (thread->sched_home != pth_gsched_active)
         return pth_error(FALSE, EPERM);
 
     /* now mark the thread as cancelled */
@@ -90,7 +86,8 @@ int pth_cancel(pth_t thread)
             return pth_error(FALSE, ESRCH);
         pth_pqueue_delete(q, thread);
 
-        /* execute cleanups */
+        /* execute cleanups (these deregister the thread from any sync
+           primitive wait queue it was parked on) */
         pth_thread_cleanup(thread);
 
         /* and now either kick it out or move it to dead queue */
@@ -99,13 +96,52 @@ int pth_cancel(pth_t thread)
             pth_tcb_free(thread);
         }
         else {
+            pth_t jw;
             pth_debug2("pth_cancel: moving cancelled thread \"%s\" to dead queue", thread->name);
             thread->join_arg = PTH_CANCELED;
             thread->state = PTH_STATE_DEAD;
             pth_pqueue_insert(&pth_DQ, PTH_PRIO_STD, thread);
+            /* mirror the scheduler's normal death path: publish death and wake
+               any (possibly cross-scheduler) joiners parked on this TCB, so a
+               remote pth_join() does not hang when we reap a thread here */
+            pth_spin_lock(&thread->join_lock);
+            thread->join_done = TRUE;
+            while ((jw = pth_waitq_shift(&thread->join_waitq)) != NULL)
+                pth_gsched_wake(jw->sched_home, jw, jw->wq_event);
+            pth_spin_unlock(&thread->join_lock);
         }
     }
     return TRUE;
+}
+
+/* cancel a thread (the friendly way) */
+int pth_cancel(pth_t thread)
+{
+    if (thread == NULL)
+        return pth_error(FALSE, EINVAL);
+
+    /* the current thread cannot be cancelled */
+    if (thread == pth_current)
+        return pth_error(FALSE, EINVAL);
+
+    /* sched_home is immutable (set at spawn), so this read is always safe */
+    if (thread->sched_home != pth_gsched_active) {
+        /* cross-scheduler: hand the request to the target's home scheduler,
+           which owns the TCB and run queues. The cancellation is carried out
+           asynchronously there, matching pthread_cancel(3) semantics (this is
+           a request, not a synchronous kill). For a *detached* target that may
+           already have exited, this is inherently racy, exactly as in POSIX;
+           the home scheduler re-validates the thread before acting. */
+        if (!pth_gsched_post(thread->sched_home, PTH_GMSG_CANCEL, thread, NULL))
+            return pth_error(FALSE, EAGAIN);
+        return TRUE;
+    }
+
+    /* the thread has to be at least still alive */
+    if (thread->state == PTH_STATE_DEAD)
+        return pth_error(FALSE, EPERM);
+
+    return pth_cancel_local(thread);
 }
 
 /* abort a thread (the cruel way) */
