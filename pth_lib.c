@@ -509,6 +509,18 @@ void pth_exit(void *value)
     abort();
 }
 
+/* dequeue us from a foreign thread's join wait queue if we get cancelled
+   inside pth_wait(3), so the dying thread's scheduler never dereferences
+   our freed thread control block */
+static void pth_join_cleanup(void *arg)
+{
+    pth_t tid = (pth_t)arg;
+    pth_spin_lock(&tid->join_lock);
+    pth_waitq_remove(&tid->join_waitq, pth_current);
+    pth_spin_unlock(&tid->join_lock);
+    return;
+}
+
 /* waits for the termination of the specified thread */
 int pth_join(pth_t tid, void **value)
 {
@@ -520,8 +532,35 @@ int pth_join(pth_t tid, void **value)
         return pth_error(FALSE, EDEADLK);
     if (tid != NULL && !tid->joinable)
         return pth_error(FALSE, EINVAL);
-    if (tid != NULL && tid->sched_home != pth_gsched_active)
-        return pth_error(FALSE, EINVAL); /* no cross-scheduler join (yet) */
+    if (tid != NULL && tid->sched_home != pth_gsched_active) {
+        /* cross-scheduler join: park on the target thread's per-TCB notify
+           queue, which its home scheduler drains when the thread dies. Then
+           read the return value and ask that scheduler to reap the TCB (it
+           owns the dead thread's control block; see MULTISCHED-DESIGN.md).
+           NOTE: a thread joined across schedulers must have exactly one
+           joiner and must not also be subject to join-any on its own
+           scheduler (same single-joiner rule as classic pth_join). */
+        void *arg;
+        pth_spin_lock(&tid->join_lock);
+        if (!tid->join_done) {
+            ev = pth_event(PTH_EVENT_NOTIFY|PTH_MODE_STATIC, &ev_key, (void *)tid);
+            pth_current->wq_event = ev;
+            pth_waitq_append(&tid->join_waitq, pth_current);
+            pth_spin_unlock(&tid->join_lock);
+            pth_cleanup_push(pth_join_cleanup, tid);
+            pth_wait(ev);
+            pth_cleanup_pop(FALSE);
+            pth_spin_lock(&tid->join_lock);
+            /* no-op if the dying scheduler already dequeued us */
+            pth_waitq_remove(&tid->join_waitq, pth_current);
+        }
+        arg = tid->join_arg;
+        pth_spin_unlock(&tid->join_lock);
+        if (value != NULL)
+            *value = arg;
+        pth_gsched_post(tid->sched_home, PTH_GMSG_REAP, tid, NULL);
+        return TRUE;
+    }
     if (pth_ctrl(PTH_CTRL_GETTHREADS) == 1)
         return pth_error(FALSE, EDEADLK);
     if (tid == NULL)

@@ -76,6 +76,11 @@ struct pth_st {
     /* thread joining */
     int            joinable;             /* whether thread is joinable                  */
     void          *join_arg;             /* joining argument                            */
+    /* cross-scheduler join: a notify queue on the TCB, serviced by this
+       thread's home scheduler when it dies (see MULTISCHED-DESIGN.md) */
+    volatile int   join_lock;            /* spinlock guarding join_waitq + join_done    */
+    pth_waitq_t    join_waitq;           /* threads blocked in pth_join() on this TCB   */
+    int            join_done;            /* set under join_lock once this thread is dead*/
 
     /* per-thread specific storage */
     const void   **data_value;           /* thread specific  values                     */
@@ -120,6 +125,9 @@ intern pth_t pth_tcb_alloc(unsigned int stacksize, void *stackaddr)
     t->sched_home = NULL;
     t->wq_next    = NULL;
     t->wq_event   = NULL;
+    pth_spin_init(&t->join_lock);
+    pth_waitq_init(&t->join_waitq);
+    t->join_done  = FALSE;
     t->stacksize  = stacksize;
     t->stack      = NULL;
     t->stackguard = NULL;

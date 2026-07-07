@@ -468,3 +468,31 @@ threads. Relatedly, the auxiliary dry-exit check must run at *both* points
 where the scheduler can block waiting for work (the empty-run-queue idle
 branch and the loop-bottom wait), because the STOP wakeup byte is consumed
 once, and blocking afterwards would sleep forever.
+
+## 11. Phase 4 progress
+
+**Mutex fairness (ownership handoff).** `PTH_MUTEX_FAIR` (a new `mx_state`
+bit, also available as `PTH_MUTEX_INIT_FAIR` and via `pth_mutex_setfair()`)
+switches a mutex from the default barging release to direct ownership
+handoff: on release the lock is passed straight to the head waiter (lock
+stays held, the waiter appends the mutex to its *own* mutexring on resume so
+no foreign TCB is touched), giving FIFO/no-starvation. The cancellation
+cleanup handler re-hands-off (or fully releases) if a thread is cancelled
+after being handed the lock, so the lock can never be stranded on a dead
+thread. Default behaviour is unchanged.
+
+**Cross-scheduler `pth_join` implemented (§5 restriction lifted).** The TCB
+gains a spinlock-guarded notify wait queue (`join_lock`, `join_waitq`,
+`join_done`). A joiner whose target lives on another scheduler parks on that
+queue on a never-polled `PTH_EVENT_NOTIFY` event instead of returning
+`EINVAL`. When a joinable thread dies, its home scheduler places it in its DQ
+(as before), then under `join_lock` sets `join_done` and delivers a directed
+wakeup (`pth_gsched_wake`) to every parked joiner. The woken joiner reads
+`join_arg` under `join_lock`, then posts a new `PTH_GMSG_REAP` inbox message
+so the *home* scheduler — the sole owner of the dead TCB — frees it; the
+joiner never frees a foreign TCB. Ordering (home does DQ-insert then wake
+before any REAP can drain on the same OS thread) guarantees the reap always
+finds the TCB in the DQ. Same-scheduler `pth_join` and `pth_join(NULL)`
+(join-any) are unchanged. Constraint (unchanged from classic Pth): a thread
+must have a single joiner, and a cross-scheduler-joined thread must not also
+be subject to join-any on its home scheduler.

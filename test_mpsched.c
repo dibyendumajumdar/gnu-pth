@@ -78,12 +78,14 @@ static void *consumer(void *arg)
     return NULL;
 }
 
-/* --- 4: restriction check helper --- */
-static pth_barrier_t fbar;
+/* --- 4: cross-scheduler join helper --- */
 static void *fworker(void *arg)
 {
-    pth_barrier_reach(&fbar);
-    return NULL;
+    int i;
+    /* do a little cooperative work so the remote joiner really blocks */
+    for (i = 0; i < 5; i++)
+        pth_yield(NULL);
+    return (void *)0x5678;
 }
 
 /* --- 3: cross-scheduler rwlock --- */
@@ -137,8 +139,9 @@ int main(int argc, char *argv[])
     if (pth_sched_count() != NSCHED || pth_sched_id() != 0)
         fails++;
 
-    /* remote threads must be non-joinable: cross-scheduler join is not
-       supported, completion is signalled through barriers instead */
+    /* tests 1-3 use non-joinable workers whose completion is signalled
+       through barriers; test 4 below uses its own joinable attribute to
+       exercise cross-scheduler pth_join (phase 4) */
     attr = pth_attr_new();
     pth_attr_set(attr, PTH_ATTR_JOINABLE, FALSE);
 
@@ -175,18 +178,21 @@ int main(int argc, char *argv[])
            (shared_val == 2000 && read_errs == 0) ? "OK" : "FAIL");
     if (!(shared_val == 2000 && read_errs == 0)) fails++;
 
-    /* 4: restrictions are enforced */
+    /* 4: cross-scheduler join now works (phase 4) */
     {
+        pth_attr_t jattr;
         pth_t t;
-        pth_barrier_init(&fbar, 2);   /* initialized BEFORE the spawn */
-        t = pth_spawn_on(1, attr, fworker, NULL);
-        if (t != NULL && pth_join(t, NULL) != FALSE) {
-            printf("restrict: cross-scheduler join unexpectedly succeeded FAIL\n");
+        void *ret = NULL;
+        jattr = pth_attr_new();
+        pth_attr_set(jattr, PTH_ATTR_JOINABLE, TRUE);
+        t = pth_spawn_on(1, jattr, fworker, NULL);   /* remote, joinable */
+        if (t != NULL && pth_join(t, &ret) == TRUE && ret == (void *)0x5678)
+            printf("join:    cross-scheduler join returned value OK\n");
+        else {
+            printf("join:    cross-scheduler join FAIL\n");
             fails++;
         }
-        else
-            printf("restrict: cross-scheduler join correctly refused OK\n");
-        pth_barrier_reach(&fbar);     /* wait for it to finish */
+        pth_attr_destroy(jattr);
     }
 
     /* shut the auxiliary schedulers down */

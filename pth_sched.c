@@ -108,6 +108,7 @@ struct pth_gmsg_st {
 #define PTH_GMSG_WAKE  1
 #define PTH_GMSG_SPAWN 2
 #define PTH_GMSG_STOP  3
+#define PTH_GMSG_REAP  4
 
 #endif /* cpp */
 
@@ -284,6 +285,14 @@ intern int pth_gsched_drain(pth_gsched_t *g)
         else if (rev->kind == PTH_GMSG_STOP) {
             /* shut down as soon as we have run dry */
             g->stop = TRUE;
+        }
+        else if (rev->kind == PTH_GMSG_REAP) {
+            /* a cross-scheduler joiner has read the return value and asked
+               us (the home scheduler) to free the dead TCB. The thread was
+               placed in our DQ when it died, before this message could be
+               processed, so it is always found here. */
+            pth_pqueue_delete(&g->DQ, rev->thread);
+            pth_tcb_free(rev->thread);
         }
         free(rev);
         any = TRUE;
@@ -518,8 +527,21 @@ intern void *pth_scheduler(void *dummy)
             pth_debug2("pth_scheduler: marking thread \"%s\" as dead", g->current->name);
             if (!g->current->joinable)
                 pth_tcb_free(g->current);
-            else
-                pth_pqueue_insert(&g->DQ, PTH_PRIO_STD, g->current);
+            else {
+                pth_t jt = g->current;
+                pth_t jw;
+                /* Keep the dead TCB in our DQ (local pth_join / join-any
+                   reap it from here, and so does a remote reap message).
+                   Then publish death to any parked cross-scheduler joiners
+                   and deliver them a directed wakeup; each will read
+                   join_arg and post PTH_GMSG_REAP back to us to free it. */
+                pth_pqueue_insert(&g->DQ, PTH_PRIO_STD, jt);
+                pth_spin_lock(&jt->join_lock);
+                jt->join_done = TRUE;
+                while ((jw = pth_waitq_shift(&jt->join_waitq)) != NULL)
+                    pth_gsched_wake(jw->sched_home, jw, jw->wq_event);
+                pth_spin_unlock(&jt->join_lock);
+            }
             g->current = NULL;
         }
 
