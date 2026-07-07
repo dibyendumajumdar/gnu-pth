@@ -346,13 +346,19 @@ invariant. The mctx bootstrap constraint (§7.4) applies.
 
 ## 5. What deliberately does NOT work across schedulers (phase 1)
 
+> Note: this section records the **phase-1** restrictions. Several have since
+> been lifted in phase 4 — see §11 (`pth_join`), §14 (message ports), §16
+> (`pth_cancel`/`pth_raise`), and the current status matrix in §15.
+
 * **`pth_join` / `PTH_EVENT_TID`** on a thread of another scheduler: the TID event polls
   a foreign TCB's `state`. Restricted (returns `EINVAL`) initially; the later fix is a
   waiter list on the TCB serviced by the dying thread's home scheduler through the same
-  inbox mechanism.
+  inbox mechanism. **(RESOLVED — implemented in §11.)**
 * **`pth_raise`, `pth_suspend`, `pth_resume`, `pth_yield(to)`, `pth_cancel`** on foreign
   threads: same reason (they mutate foreign TCBs/queues). Return `EPERM`/`EINVAL`
   cross-scheduler in phase 1; each is a candidate for a dedicated inbox message kind later.
+  **(`pth_cancel`/`pth_raise` RESOLVED in §16; `pth_suspend`/`pth_resume`/`pth_yield(to)`
+  still restricted.)**
 * **Signal events (`PTH_EVENT_SIGS`, `pth_sigwait`)**: Pth's signal machinery
   (per-loop `sigpending()` scans, handler swapping, the `pth_sigraised` protocol) is
   process-global. Scheduler 0 keeps it; auxiliary scheduler OS threads block all signals
@@ -361,7 +367,7 @@ invariant. The mctx bootstrap constraint (§7.4) applies.
 * **Message ports** (`pth_msg.c`): global `pth_msgport` ring is unprotected; out of
   scope per requirements. Documented as scheduler-0-only until given the spinlock+inbox
   treatment (which is straightforward — `PTH_EVENT_MSG` is exactly a cond-style
-  notification).
+  notification). **(RESOLVED in §14.)**
 * **fd events** stay fully functional — each scheduler runs its own `select()` over its
   own threads' fds, which needs no cross-scheduler coordination.
 
@@ -702,3 +708,96 @@ cross-scheduler `pth_join`, under both the select and poll backends.
 
 With this, the only original thread-control verbs still pinned to one scheduler
 are `pth_suspend`/`pth_resume` and directed `pth_yield(target)` (§15).
+
+
+## 17. Design assessment: the wakeup substrate vs. other M:N runtimes
+
+### What the substrate actually is
+
+Cross-scheduler communication is a **doorbell + mailbox** pattern, plus direct
+shared memory for primitive state:
+
+* **Doorbell.** A single byte written to the target scheduler's self-pipe
+  (`sigpipe`). It carries no information; its only job is to break the target
+  out of the `poll(2)`/`select(2)` call it blocks in when idle. On Linux an
+  `eventfd` would be a cheaper doorbell (one fd + an 8-byte counter instead of
+  a pipe pair).
+* **Mailbox.** A lock-free MPSC stack (Treiber) — the per-scheduler inbox —
+  carrying the payload: `WAKE` (mark an event occurred), `SPAWN` (adopt a
+  remotely created thread), `REAP` (free a joined TCB), `CANCEL`, `RAISE`,
+  `STOP`. Producers CAS-push; the owning scheduler takes the whole list with
+  one atomic exchange and processes it FIFO. The invariant that closes the
+  lost-wakeup window is **push-to-mailbox before ring-the-doorbell**, paired
+  with the scheduler clearing its pipe *before* draining — the standard
+  self-pipe discipline.
+* **Shared memory (not messages).** The synchronization primitives' internal
+  state — the mutex locked bit and waiter queue, cond waitqueue, rwlock counts,
+  msgport queues — lives in plain shared memory under small per-primitive
+  spinlocks. Threads on different schedulers read/write it directly; the inbox
+  is used only for the *directed wakeup* that follows a state change, and for
+  thread-control ops that must touch a foreign scheduler's private queues. This
+  is a hybrid, unlike pure message-passing runtimes (Erlang) that copy
+  everything through mailboxes.
+
+It is worth separating the **wakeup mechanism** from the **scheduling policy**,
+because they sit very differently against the state of the art.
+
+### The wakeup mechanism: standard and appropriate
+
+Self-pipe + `poll()` + an MPSC inbox is the same pattern libuv (`uv_async`),
+Python asyncio, and Tokio's I/O driver use to wake an event loop from another
+thread: register a wakeup fd in the same readiness set you already block on for
+I/O, and let other threads poke it. For an fd-centric green-thread library this
+is arguably the *right* idiom — each scheduler is already parked in `poll()`
+waiting for socket readiness, so unifying "an fd became ready" and "another
+scheduler wants my attention" into one blocking call avoids a second wait
+primitive. The cost is that a wakeup is two syscalls (a `write` and the `poll`
+return), ~1-3 µs round trip, versus ~0.5-1 µs for futex park/unpark (what Go and
+Tokio worker parking use). But a futex cannot also wait on fds, so a futex
+design ends up registering an eventfd in epoll anyway — i.e. it reinvents the
+self-pipe. The cheap incremental wins here are `eventfd` for the doorbell and
+`epoll`/`kqueue` for the wait (the poll-backend prototype, §12, is a step toward
+the latter); neither is a fundamental change.
+
+### The scheduling policy: deliberately conservative
+
+This is where the design trails top-tier M:N runtimes, by choice:
+
+* **No migration / no work-stealing.** The core invariant — a thread lives and
+  dies on its home scheduler — lets the entire single-threaded scheduler core
+  (run queues, event-ring walking, context switching) be reused verbatim and
+  never made concurrent. That is a large correctness and reviewability win for
+  retrofitting M:N onto a mature cooperative library. The cost is load
+  balancing: Go, Tokio, Java Loom and Erlang/BEAM all work-steal across
+  concurrent (Chase-Lev-style) deques so an idle core pulls work from a busy
+  one. Here, balancing is *static* — the pthread layer round-robins at thread
+  creation (§13) and never rebalances — so uniform workloads spread well but
+  skewed ones can leave cores idle with no recourse. Work-stealing is where most
+  M:N runtime complexity and bugs live, so omitting it is a defensible trade,
+  but it is the clearest scalability gap.
+* **Cooperative, no preemption.** A CPU-bound thread that never yields
+  monopolizes its scheduler. Go (async preemption via signals), Loom, and BEAM
+  (reduction counting) preempt. This is inherent to Pth's model, not the MP
+  layer.
+* **The msgport "kick everyone" path (§14)** is the least refined piece — a
+  `put` wakes *all* other schedulers to re-poll rather than doing a directed
+  wakeup to the specific waiter (as mutex/cond do), because ports do not track
+  their waiters. Fine for a low-frequency IPC feature; O(schedulers) doorbells
+  per message, so not suitable as a hot path.
+
+### Verdict
+
+The communication substrate is sound, standard, and correct — not novel, but
+the right pattern for an fd-driven library, with careful lost-wakeup reasoning.
+Where it trails Go/Tokio/Loom is scheduling *policy*, not *plumbing*: static
+load balancing (no work-stealing) and cooperative-only execution. For I/O-bound
+or evenly distributed workloads it should hold up well; for fine-grained compute
+parallelism with skewed load or heavy cross-thread signalling, a work-stealing,
+futex-parked, preemptive runtime would pull ahead. Given the goal — retrofitting
+M:N onto Pth while keeping the existing core intact and source-compatible —
+trading peak scalability for simplicity and correctness is a reasonable place to
+land. Natural next steps to close the gap, in increasing order of effort:
+`eventfd` doorbell, an `epoll`/`kqueue` scheduler backend, directed msgport
+wakeups, and ultimately some form of work-stealing / thread migration (by far
+the largest, as it breaks the single-owner invariant the rest of the design
+leans on).
