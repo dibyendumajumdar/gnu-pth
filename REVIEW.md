@@ -222,3 +222,34 @@ poll-related tests: `test_mpsched`, `test_mutexfair_mp`, `test_join_mp`,
 `test_msgport_mp`, `test_cancelraise_mp`, `test_suspend_mp`,
 `test_cancelblock_mp`, and `test_once_mp`.
 
+
+---
+
+## Second Follow-up Resolution
+
+### High — once hangs if the initializer is cancelled: FIXED
+`pth_once()` and `pthread_once()` now push a cleanup handler
+(`pth_once_cleanup`) around the initializer that, on cancellation or non-local
+exit, resets the control word from IN_PROGRESS (1) back to UNINITIALIZED (0);
+on normal completion the handler is popped without executing and the control is
+published as DONE (2). A caller cancelled inside the initializer therefore
+leaves the control as if `pth_once()` was never called (POSIX behaviour), and a
+later caller re-runs and completes it instead of spinning forever on state 1.
+
+New `test_oncecancel_mp.c`: thread A wins the once race and blocks inside the
+initializer; thread B waits; A is cancelled; B then re-runs the initializer to
+completion and returns. With the fix the initializer starts twice (aborted +
+retried), completes once, and B returns; **without the fix the test hangs**
+(B never observes DONE) -- confirmed by reverting the cleanup and observing a
+timeout.
+
+### Low — stale `pth.3`: FIXED
+`pth.3` was regenerated from `pth.pod` via the project's `make pth.3` rule
+(pod2man + the `PTH_VERSION_STR` substitution), so the message-port lifetime
+notes are now present in the shipped manpage.
+
+### Second Follow-up Verification
+Rebuilt and ran under plain `PTH_MP`, `PTH_MP + PTH_SCHED_POLL` (the new
+defaults), the pthread emulation, and the default single-scheduler build. All MP
+tests pass, including the two new `test_once_mp` and `test_oncecancel_mp`; the
+latter was confirmed to hang against a build with the cleanup fix reverted.

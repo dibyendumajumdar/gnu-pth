@@ -896,3 +896,16 @@ A second review round raised two more items:
   documented (pth.pod): a port must outlive all threads that may use a reference
   to it; destruction is the application's responsibility to serialize.
   `test_msgport_mp.c` exercises the safe pattern.
+
+## 21. Second follow-up review fixes
+
+* **`pth_once`/`pthread_once` could hang if the initializer was cancelled.** The
+  atomic once state machine (§20) left the control stuck at IN_PROGRESS if the
+  initializing thread was cancelled or exited non-locally between states 1 and
+  2, so waiters spun forever. Fixed by pushing a cleanup handler
+  (`pth_once_cleanup`) around the initializer that resets 1 -> 0 on
+  cancellation/non-completion (popped without executing on normal completion);
+  a later caller then retries, per POSIX. Test `test_oncecancel_mp.c` (hangs
+  against the un-fixed build).
+* **Regenerated `pth.3`** from `pth.pod` so the shipped manpage carries the
+  current API/contract text (including the message-port lifetime note).

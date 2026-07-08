@@ -410,7 +410,9 @@ int pthread_once(
             return OK;
         if (st == 0) {
             if (pth_atomic_cas(once_control, 0, 1)) {
+                pth_cleanup_push(pth_once_cleanup, once_control);
                 init_routine();
+                pth_cleanup_pop(FALSE);
                 pth_atomic_store(once_control, 2);
                 return OK;
             }

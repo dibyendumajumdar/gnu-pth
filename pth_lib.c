@@ -815,6 +815,18 @@ int pth_nap(pth_time_t naptime)
  * do not hold a lock across the user constructor, which may itself call back
  * into Pth or block.
  */
+/* If the once initializer does not complete (its thread is cancelled or exits
+   non-locally via pth_exit), reset the control from IN_PROGRESS back to
+   UNINITIALIZED so a later caller retries -- POSIX requires cancellation inside
+   the init routine to leave the control as if pth_once() was never called.
+   Registered as a cleanup handler around the initializer; on normal completion
+   it is popped without executing. */
+intern void pth_once_cleanup(void *arg)
+{
+    pth_atomic_store((pth_atomic_t *)arg, 0);
+    return;
+}
+
 int pth_once(pth_once_t *oncectrl, void (*constructor)(void *), void *arg)
 {
     if (oncectrl == NULL || constructor == NULL)
@@ -825,7 +837,9 @@ int pth_once(pth_once_t *oncectrl, void (*constructor)(void *), void *arg)
             return TRUE;                      /* already initialized */
         if (st == 0) {
             if (pth_atomic_cas(oncectrl, 0, 1)) {
+                pth_cleanup_push(pth_once_cleanup, oncectrl);
                 constructor(arg);             /* we won: run it once */
+                pth_cleanup_pop(FALSE);       /* completed: keep IN_PROGRESS -> DONE */
                 pth_atomic_store(oncectrl, 2);
                 return TRUE;
             }
