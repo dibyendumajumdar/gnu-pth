@@ -1,0 +1,79 @@
+name: CI
+
+# Build and test GNU Pth (multi-scheduler fork) on Linux, FreeBSD and macOS
+# using the CMake build, on every push and pull request.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Linux and macOS run natively on GitHub-hosted runners ----------------
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # macOS ucontext (makecontext/swapcontext) is deprecated, so PTH_MP may not
+    # be usable there; that combination is marked non-blocking.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux (Ubuntu)
+          - name: "linux / MP + poll + pthread"
+            os: ubuntu-latest
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+          - name: "linux / MP + select"
+            os: ubuntu-latest
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=OFF -DPTH_BUILD_PTHREAD=ON"
+          - name: "linux / single-scheduler"
+            os: ubuntu-latest
+            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
+          # macOS
+          - name: "macos / single-scheduler"
+            os: macos-latest
+            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
+          - name: "macos / MP + poll + pthread"
+            os: macos-latest
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DPTH_BUILD_TESTS=ON ${{ matrix.opts }}
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 180
+
+  # ---- FreeBSD runs inside a VM on a Linux runner ---------------------------
+  freebsd:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "freebsd / MP + poll + pthread"
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+          - name: "freebsd / single-scheduler"
+            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y cmake ninja
+          run: |
+            cmake -G Ninja -S . -B build -DPTH_BUILD_TESTS=ON ${{ matrix.opts }}
+            cmake --build build --parallel 2
+            ctest --test-dir build --output-on-failure --timeout 180
