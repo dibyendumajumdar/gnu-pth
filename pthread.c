@@ -40,7 +40,15 @@
  */
 #define _PTHREAD_PRIVATE
 #include "pthread.h"
+/* Some systems (e.g. FreeBSD) declare pthread_kill() in <signal.h> -- pulled in
+   transitively by pth_p.h below -- using the system's own pthread_t, which
+   clashes with the emulation's pthread_kill() declared in "pthread.h" above
+   (glibc instead spells it with the pthread_t token, which pth has remapped, so
+   it does not clash there). Nothing here uses the system pthread_kill(), so
+   hide its declaration while pth_p.h's headers are processed. */
+#define pthread_kill __pth_sys_pthread_kill
 #include "pth_p.h"
+#undef pthread_kill
 #undef _PTHREAD_PRIVATE
 
 /* general success return value */

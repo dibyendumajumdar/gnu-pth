@@ -570,6 +570,16 @@ library):
 Both go through one set of `PTH_OS_{CREATE,JOIN,SIGMASK}` macros, so the
 scheduler bootstrap/shutdown code is backend-agnostic.
 
+**Portability note (FreeBSD).** `pthread.c` includes both the emulation
+`pthread.h` (which declares `pthread_kill(pthread_t, int)` with Pth's own
+`pthread_t`) and `pth_p.h` (which pulls in `<signal.h>`). On glibc, `<signal.h>`
+spells `pthread_kill`'s argument with the `pthread_t` token that Pth has
+remapped, so the two declarations agree; on FreeBSD `<signal.h>` uses the raw
+system type `__pthread_t`, so they conflict. `pthread.c` therefore hides the
+system `pthread_kill` declaration (`#define pthread_kill __pth_sys_pthread_kill`
+around the `pth_p.h` include) -- nothing there uses it. This surfaced only via
+the FreeBSD CI job.
+
 **Startup / shutdown.** The first pthread call runs `pth_mp_init(N)` where
 `N = $PTH_SCHEDULERS` if set, else the online CPU count (clamped to
 `PTH_GSCHED_MAX`); the `atexit` handler runs `pth_mp_shutdown()` before
