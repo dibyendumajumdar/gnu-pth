@@ -36,14 +36,16 @@ jobs:
           - name: "linux / single-scheduler"
             os: ubuntu-latest
             opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
+          - name: "linux / MP + Boost.Context (bctx)"
+            os: ubuntu-latest
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON -DPTH_MCTX_MTH=bctx"
           # macOS
           - name: "macos / single-scheduler"
             os: macos-latest
             opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
-          - name: "macos / MP + poll + pthread"
+          - name: "macos / MP + poll + pthread (bctx)"
             os: macos-latest
             opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
-            experimental: true
     steps:
       - uses: actions/checkout@v4
       - name: Configure

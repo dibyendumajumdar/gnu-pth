@@ -374,6 +374,9 @@ intern int pth_gsched_drain(pth_gsched_t *g)
                all signals blocked (signals are scheduler 0 business) */
             if (g->id != 0)
                 sigfillset(&rev->thread->mctx.uc.uc_sigmask);
+#elif PTH_MCTX_MTH(bctx)
+            if (g->id != 0)
+                sigfillset(&rev->thread->mctx.sysmask);
 #endif
             rev->thread->state = PTH_STATE_NEW;
             pth_pqueue_insert(&g->NQ, rev->thread->prio, rev->thread);

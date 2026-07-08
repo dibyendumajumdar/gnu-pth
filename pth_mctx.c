@@ -42,6 +42,9 @@
 #if PTH_MCTX_MTH(mcsc)
 #include <ucontext.h>
 #endif
+#if PTH_MCTX_MTH(bctx)
+#include "pth_fcontext.h"
+#endif
 
 typedef struct pth_mctx_st pth_mctx_t;
 struct pth_mctx_st {
@@ -50,6 +53,10 @@ struct pth_mctx_st {
     int restored;
 #elif PTH_MCTX_MTH(sjlj)
     pth_sigjmpbuf jb;
+#elif PTH_MCTX_MTH(bctx)
+    pth_fcontext_t fc;      /* current continuation (Boost.Context)         */
+    void (*func)(void);     /* entry function of a freshly-made context     */
+    sigset_t sysmask;       /* real signal mask, saved/restored on switch   */
 #else
 #error "unknown mctx method"
 #endif
@@ -82,6 +89,8 @@ struct pth_mctx_st {
 #define pth_mctx_save(mctx) \
         ( (mctx)->error = errno, \
           pth_sigsetjmp((mctx)->jb) )
+#elif PTH_MCTX_MTH(bctx)
+#define pth_mctx_save(mctx) (0) /* unused for bctx: switch is a single primitive */
 #else
 #error "unknown mctx method"
 #endif
@@ -99,6 +108,8 @@ struct pth_mctx_st {
 #define pth_mctx_restore(mctx) \
         ( errno = (mctx)->error, \
           (void)pth_siglongjmp((mctx)->jb, 1) )
+#elif PTH_MCTX_MTH(bctx)
+#define pth_mctx_restore(mctx) pth_mctx_restore_bctx(mctx)
 #else
 #error "unknown mctx method"
 #endif
@@ -135,6 +146,10 @@ struct pth_mctx_st {
     if (pth_mctx_save(old) == 0) \
         pth_mctx_restore(new); \
     pth_mctx_restored(old);
+#elif PTH_MCTX_MTH(bctx)
+#define pth_mctx_switch(old,new) \
+    _pth_mctx_switch_debug \
+    pth_mctx_switch_bctx((old),(new));
 #else
 #error "unknown mctx method"
 #endif
@@ -174,6 +189,77 @@ intern int pth_mctx_set(
     /* configure startup function (with no arguments) */
     makecontext(&(mctx->uc), func, 0+1);
 
+    return TRUE;
+}
+
+#elif PTH_MCTX_MTH(bctx)
+
+/*
+ * VARIANT: BOOST.CONTEXT (fcontext) APPROACH
+ *
+ * A portable, assembly-based user-space context switch (vendored under
+ * fcontext/, Boost Software License 1.0). Chosen where the SVR4/SUSv2
+ * ucontext(3) facility is unavailable or deprecated (e.g. macOS/arm64).
+ * Unlike ucontext, fcontext carries no signal mask, so the real signal mask
+ * is saved/restored explicitly on every switch -- mirroring what
+ * swapcontext(2) does implicitly for the mcsc method.
+ *
+ * fcontext bookkeeping: X->fc always holds the continuation to resume X, and
+ * it is (re)written by whoever X switches to, at the moment they resume. The
+ * caller passes its own mctx as the jump datum so the resumed side can record
+ * it; a freshly made context finds its own mctx through pth_bctx_self, set
+ * immediately before the jump.
+ */
+
+/* per-OS-thread scratch: the context a switch is entering (so a fresh context
+   can find its func), and a sink for the discarded continuation of a
+   non-returning restore */
+static PTH_TLS pth_mctx_t *pth_bctx_self;
+static PTH_TLS pth_mctx_t  pth_bctx_trash;
+
+/* entry stub for a freshly made context */
+static void pth_bctx_entry(pth_transfer_t tr)
+{
+    pth_mctx_t *from = (pth_mctx_t *)tr.data;
+    from->fc = tr.fctx;              /* record where the switcher suspended  */
+    (*pth_bctx_self->func)();        /* run our own entry (never returns)    */
+    abort();                         /* NOTREACHED */
+}
+
+intern void pth_mctx_switch_bctx(pth_mctx_t *old, pth_mctx_t *new)
+{
+    pth_transfer_t tr;
+    /* install the incoming context's real signal mask, saving ours (one
+       syscall), exactly as swapcontext(2) would */
+    pth_sc(sigprocmask)(SIG_SETMASK, &new->sysmask, &old->sysmask);
+    pth_bctx_self = new;
+    tr = jump_fcontext(new->fc, old);           /* -> new; resume here later */
+    ((pth_mctx_t *)tr.data)->fc = tr.fctx;      /* record resumer's suspension */
+}
+
+intern void pth_mctx_restore_bctx(pth_mctx_t *mctx)
+{
+    /* jump to mctx and do not return here; the discarded continuation lands
+       in the per-thread trash mctx */
+    pth_sc(sigprocmask)(SIG_SETMASK, &mctx->sysmask, NULL);
+    pth_bctx_self = mctx;
+    (void)jump_fcontext(mctx->fc, &pth_bctx_trash);
+    /* NOTREACHED */
+}
+
+intern int pth_mctx_set(
+    pth_mctx_t *mctx, void (*func)(void), char *sk_addr_lo, char *sk_addr_hi)
+{
+    /* fcontext wants the TOP (highest address) of the stack region */
+    mctx->fc = make_fcontext((void *)sk_addr_hi,
+                             (size_t)(sk_addr_hi - sk_addr_lo),
+                             pth_bctx_entry);
+    if (mctx->fc == NULL)
+        return FALSE;
+    mctx->func = func;
+    /* capture the current signal mask as this context's initial mask */
+    pth_sc(sigprocmask)(SIG_SETMASK, NULL, &mctx->sysmask);
+    mctx->error = errno;
     return TRUE;
 }
 

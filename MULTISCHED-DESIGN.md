@@ -919,3 +919,39 @@ A second review round raised two more items:
   against the un-fixed build).
 * **Regenerated `pth.3`** from `pth.pod` so the shipped manpage carries the
   current API/contract text (including the message-port lifetime note).
+
+## 22. Portable context switching: the "bctx" (Boost.Context) method
+
+`ucontext(3)` (`makecontext`/`swapcontext`, the `mcsc` method that `PTH_MP`
+required) is deprecated on macOS and unusable on Apple Silicon, so a portable
+alternative was added: `bctx`, built on Boost.Context's low-level `fcontext`
+API. The relevant assembly (`make_fcontext`/`jump_fcontext`) is vendored under
+`fcontext/` (Boost Software License 1.0) for x86_64 and arm64, in both ELF
+(Linux/FreeBSD) and Mach-O (macOS) formats; only two routines are used and they
+carry hidden visibility so they neither export from a shared libpth nor clash
+with an application's own Boost.Context.
+
+`fcontext` differs from `ucontext` in two ways that the `bctx` method
+(`pth_mctx.c`, `PTH_MCTX_MTH(bctx)`) handles:
+
+* **Handle bookkeeping.** `fcontext` has no separate save/restore; a single
+  `jump_fcontext(to, data)` both suspends the caller and resumes `to`. The
+  invariant kept is *X->fc always holds the continuation to resume X*, rewritten
+  by whoever X switches to at the moment they resume (the switcher passes its
+  own mctx as the jump datum). A freshly `make_fcontext`'d context finds its own
+  entry function through a per-OS-thread `pth_bctx_self` set immediately before
+  the jump; `pth_mctx_restore` (used by `pth_uctx`) discards the abandoned
+  continuation into a per-thread trash mctx.
+* **Signal mask.** `fcontext` carries no signal mask, whereas `swapcontext`
+  restores one. `bctx` therefore `sigprocmask`s the incoming context's mask on
+  every switch (stored in a new `sysmask` TCB-context field), matching the
+  `mcsc` semantics; auxiliary-scheduler adoption fills that mask (as the mcsc
+  path did to `uc_sigmask`).
+
+**Selection (CMake).** A new arch/format probe picks the right vendored asm;
+`bctx` is the *default on macOS* and a fallback elsewhere, selectable anywhere
+with `-DPTH_MCTX_MTH=bctx`, and is now accepted by the `PTH_MP` requirement
+check alongside `mcsc`. The full MP test suite passes with `bctx` as the context
+method on Linux/x86_64; macOS is exercised via CI. (The autoconf build still
+selects `mcsc`/`sjlj` only; `bctx` is wired through the CMake build, which is the
+supported build for this fork.)

@@ -12,6 +12,7 @@ set(PTH_VERSION_STR "${CMAKE_MATCH_1} (${CMAKE_MATCH_2})")
 set(PTH_VERSION_SHORT "${CMAKE_MATCH_1}")
 
 project(pth VERSION ${PTH_VERSION_SHORT} LANGUAGES C)
+enable_language(ASM)   # for the vendored Boost.Context fcontext asm (bctx method)
 
 if(WIN32 AND NOT CYGWIN)
     message(FATAL_ERROR "GNU Pth requires a POSIX platform (Linux, macOS, BSD, WSL, Cygwin).")
@@ -233,20 +234,52 @@ if(HAVE_UCONTEXT_H AND HAVE_MAKECONTEXT AND HAVE_SWAPCONTEXT
     endif()
 endif()
 
+# Boost.Context (bctx) method: pick the vendored fcontext asm for this
+# architecture and object format (ELF vs Mach-O).
+set(_bctx_asm "")
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    if(APPLE)
+        set(_fmt macho)
+    else()
+        set(_fmt elf)
+    endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        set(_bctx_asm
+            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/jump_x86_64_sysv_${_fmt}_gas.S"
+            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/make_x86_64_sysv_${_fmt}_gas.S")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        set(_bctx_asm
+            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/jump_arm64_aapcs_${_fmt}_gas.S"
+            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/make_arm64_aapcs_${_fmt}_gas.S")
+    endif()
+endif()
+set(_bctx_available FALSE)
+if(NOT "${_bctx_asm}" STREQUAL "")
+    set(_bctx_available TRUE)
+endif()
+
 set(_mth "${PTH_MCTX_MTH}")
 set(_dsp "${PTH_MCTX_DSP}")
 set(_stk "${PTH_MCTX_STK}")
 if(_mth STREQUAL "")
-    if(_mcsc_works)
+    if(APPLE AND _bctx_available)
+        set(_mth bctx)     # ucontext(3) is deprecated/unreliable on macOS
+    elseif(_mcsc_works)
         set(_mth mcsc)
+    elseif(_bctx_available)
+        set(_mth bctx)
     elseif(HAVE_SIGSETJMP OR HAVE_SETJMP)
         set(_mth sjlj)
     else()
         message(FATAL_ERROR "no appropriate mctx method found")
     endif()
 endif()
+if(_mth STREQUAL "bctx" AND NOT _bctx_available)
+    message(FATAL_ERROR "PTH_MCTX_MTH=bctx: no vendored fcontext asm for "
+                        "${CMAKE_SYSTEM_PROCESSOR} / ${CMAKE_SYSTEM_NAME}")
+endif()
 if(_dsp STREQUAL "")
-    if(_mth STREQUAL "mcsc")
+    if(_mth STREQUAL "mcsc" OR _mth STREQUAL "bctx")
         set(_dsp sc)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(_dsp sjljlx)
@@ -259,7 +292,7 @@ if(_dsp STREQUAL "")
     endif()
 endif()
 if(_stk STREQUAL "")
-    if(_mth STREQUAL "mcsc")
+    if(_mth STREQUAL "mcsc" OR _mth STREQUAL "bctx")
         set(_stk mc)
     elseif(_dsp MATCHES "^(sjljlx|sjljisc|sjljw32)$")
         set(_stk none)
@@ -276,14 +309,22 @@ set(PTH_MCTX_DSP_RESOLVED "${_dsp}")
 set(PTH_MCTX_STK_RESOLVED "${_stk}")
 message(STATUS "Pth mctx implementation: ${_mth}/${_dsp}/${_stk}")
 
+# vendored Boost.Context asm to compile into the library, only for the bctx method
+set(_bctx_srcs "")
+if(_mth STREQUAL "bctx")
+    set(_bctx_srcs ${_bctx_asm})
+    message(STATUS "Pth bctx fcontext asm: ${_bctx_asm}")
+endif()
+
 # -- multi-scheduler (MP) requirements ----------------------------------------
 if(PTH_MP)
     # the sjlj mctx variants bootstrap stacks via process-global state and a
     # SIGUSR1 handler, which is unsafe with concurrent schedulers (see
     # MULTISCHED-DESIGN.md section 7): require the reentrant makecontext variant
-    if(NOT _mth STREQUAL "mcsc")
+    if(NOT (_mth STREQUAL "mcsc" OR _mth STREQUAL "bctx"))
         message(FATAL_ERROR "PTH_MP requires the mcsc (makecontext/swapcontext) "
-                            "mctx method; detected/forced: ${_mth}/${_dsp}/${_stk}")
+                            "or bctx (Boost.Context) mctx method; detected/forced: "
+                            "${_mth}/${_dsp}/${_stk}")
     endif()
     check_c_source_compiles("
         #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
@@ -423,7 +464,7 @@ set(PTH_SOURCES
     pth_data.c pth_clean.c pth_cancel.c pth_msg.c pth_sync.c pth_fork.c
     pth_util.c pth_high.c pth_syscall.c pth_ext.c pth_compat.c pth_string.c)
 
-add_library(pth ${PTH_SOURCES})
+add_library(pth ${PTH_SOURCES} ${_bctx_srcs})
 add_dependencies(pth pth_p_h)
 target_include_directories(pth PUBLIC "${GEN}" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(pth PUBLIC ${PTH_EXTRA_LIBS})
@@ -439,7 +480,7 @@ set_target_properties(pth PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
 
 if(PTH_BUILD_PTHREAD)
-    add_library(pth_pthread ${PTH_SOURCES} pthread.c)
+    add_library(pth_pthread ${PTH_SOURCES} pthread.c ${_bctx_srcs})
     add_dependencies(pth_pthread pth_p_h)
     target_include_directories(pth_pthread PUBLIC "${GEN}" "${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_definitions(pth_pthread PRIVATE PTH_EMULATION)

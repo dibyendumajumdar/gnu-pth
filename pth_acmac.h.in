@@ -47,6 +47,7 @@
 #define PTH_MCTX_STK(which)  (PTH_MCTX_STK_use == (PTH_MCTX_STK_##which))
 #define PTH_MCTX_MTH_mcsc    1
 #define PTH_MCTX_MTH_sjlj    2
+#define PTH_MCTX_MTH_bctx    3
 #define PTH_MCTX_DSP_sc      1
 #define PTH_MCTX_DSP_ssjlj   2
 #define PTH_MCTX_DSP_sjlj    3
