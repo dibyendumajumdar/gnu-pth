@@ -671,8 +671,9 @@ The synchronization objects (\f(CW\*(C`pth_mutex_t\*(C'\fR, \f(CW\*(C`pth_cond_t
 \&\f(CW\*(C`pth_barrier_t\*(C'\fR), message ports, and \f(CW\*(C`pth_join\*(C'\fR(3) all work across schedulers:
 a thread on one scheduler may lock a mutex held by, wait on a condition
 signalled by, or join a thread owned by another scheduler. The thread-control
-operations \f(CW\*(C`pth_cancel\*(C'\fR, \f(CW\*(C`pth_raise\*(C'\fR, \f(CW\*(C`pth_suspend\*(C'\fR, \f(CW\*(C`pth_resume\*(C'\fR and
-\&\f(CW\*(C`pth_yield\*(C'\fR(\fItarget\fR) also work across schedulers, but as \fIasynchronous
+operations \f(CW\*(C`pth_cancel\*(C'\fR, \f(CW\*(C`pth_abort\*(C'\fR, \f(CW\*(C`pth_raise\*(C'\fR, \f(CW\*(C`pth_suspend\*(C'\fR,
+\&\f(CW\*(C`pth_resume\*(C'\fR and \f(CW\*(C`pth_yield\*(C'\fR(\fItarget\fR) also work across schedulers, but as
+\&\fIasynchronous
 requests\fR: they are delivered to the target's home scheduler and take effect at
 that scheduler's next scheduling point, not necessarily immediately.
 .PP
@@ -850,7 +851,7 @@ thread is running.
 (\f(CW\*(C`pth_mutex_t\*(C'\fR, \f(CW\*(C`pth_cond_t\*(C'\fR, \f(CW\*(C`pth_rwlock_t\*(C'\fR, \f(CW\*(C`pth_barrier_t\*(C'\fR), message
 ports, and \f(CW\*(C`pth_join\*(C'\fR(3) operate correctly regardless of which scheduler owns
 the thread or object involved. The thread-control operations \f(CW\*(C`pth_cancel\*(C'\fR(3),
-\&\f(CW\*(C`pth_raise\*(C'\fR(3), \f(CW\*(C`pth_suspend\*(C'\fR(3), \f(CW\*(C`pth_resume\*(C'\fR(3) and
+\&\f(CW\*(C`pth_abort\*(C'\fR(3), \f(CW\*(C`pth_raise\*(C'\fR(3), \f(CW\*(C`pth_suspend\*(C'\fR(3), \f(CW\*(C`pth_resume\*(C'\fR(3) and
 \&\f(CW\*(C`pth_yield\*(C'\fR(\fItarget\fR) additionally work when the target thread belongs to
 another scheduler, but there they behave as \fIasynchronous requests\fR: the
 operation is forwarded to the target's home scheduler and applied at that
@@ -1043,6 +1044,13 @@ as `\fIfunc\fR(\fIarg\fR)' in the system. In other words: Only the first call to
 \&\fBpth_once\fR\|(3) by any thread in the system succeeds. The variable referenced via
 \&\fIctrlvar\fR should be declared as `\f(CW\*(C`pth_once_t\*(C'\fR \fIvariable-name\fR =
 \&\f(CW\*(C`PTH_ONCE_INIT\*(C'\fR;' before calling this function.
+.Sp
+This is safe under \fBM:N\fR multi-scheduler operation: when several threads on
+different schedulers call \fBpth_once\fR\|(3) on the same \fIctrlvar\fR concurrently,
+exactly one runs \fIfunc\fR while the others wait until it has completed. If \fIfunc\fR
+does not complete because its thread is cancelled or exits non-locally, the
+control variable is reset as if \fBpth_once\fR\|(3) had never been called, so a
+subsequent call runs \fIfunc\fR again.
 .IP "pth_t \fBpth_self\fR(void);" 4
 .IX Item "pth_t pth_self(void);"
 This just returns the unique thread handle of the currently running thread.
@@ -1141,7 +1149,9 @@ This is the cruel way to cancel a thread \fItid\fR. When it's already dead and
 waits to be joined it just joins it (via `\f(CW\*(C`pth_join(\*(C'\fR\fItid\fR\f(CW\*(C`, NULL)\*(C'\fR') and
 this way kicks it out of the system.  Else it forces the thread to be not
 joinable and to allow asynchronous cancellation and then cancels it via
-`\f(CW\*(C`pth_cancel(\*(C'\fR\fItid\fR\f(CW\*(C`)\*(C'\fR'.
+`\f(CW\*(C`pth_cancel(\*(C'\fR\fItid\fR\f(CW\*(C`)\*(C'\fR'. Under M:N, if \fItid\fR belongs to another scheduler
+the abort is forwarded to that scheduler and carried out there (an asynchronous
+request, like the other cross-scheduler thread-control operations above).
 .IP "int \fBpth_join\fR(pth_t \fItid\fR, void **\fIvalue\fR);" 4
 .IX Item "int pth_join(pth_t tid, void **value);"
 This joins the current thread with the thread specified via \fItid\fR.
@@ -2376,7 +2386,7 @@ Under \fBM:N\fR multi-scheduler mode (\f(CW\*(C`pth_mp_init\*(C'\fR(3)) a few fa
 tied to the first scheduler (scheduler 0, which runs the main thread):
 \&\fBPth\fR's process-signal handling (\f(CW\*(C`PTH_EVENT_SIGS\*(C'\fR, \f(CW\*(C`pth_sigwait\*(C'\fR(3)) and
 \&\f(CW\*(C`pth_fork\*(C'\fR(3); threads that use these must run on scheduler 0. Cross-scheduler
-\&\f(CW\*(C`pth_cancel\*(C'\fR/\f(CW\*(C`pth_raise\*(C'\fR/\f(CW\*(C`pth_suspend\*(C'\fR/\f(CW\*(C`pth_resume\*(C'\fR/\f(CW\*(C`pth_yield\*(C'\fR(\fItarget\fR)
+\&\f(CW\*(C`pth_cancel\*(C'\fR/\f(CW\*(C`pth_abort\*(C'\fR/\f(CW\*(C`pth_raise\*(C'\fR/\f(CW\*(C`pth_suspend\*(C'\fR/\f(CW\*(C`pth_resume\*(C'\fR/\f(CW\*(C`pth_yield\*(C'\fR(\fItarget\fR)
 are applied asynchronously at the target scheduler's next scheduling point.
 \&\f(CW\*(C`pth_ctrl(PTH_CTRL_GETTHREADS)\*(C'\fR and the load average are per-scheduler. The
 public synchronization structure layouts changed for M:N support, so clients

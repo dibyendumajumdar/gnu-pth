@@ -610,8 +610,9 @@ The synchronization objects (C<pth_mutex_t>, C<pth_cond_t>, C<pth_rwlock_t>,
 C<pth_barrier_t>), message ports, and C<pth_join>(3) all work across schedulers:
 a thread on one scheduler may lock a mutex held by, wait on a condition
 signalled by, or join a thread owned by another scheduler. The thread-control
-operations C<pth_cancel>, C<pth_raise>, C<pth_suspend>, C<pth_resume> and
-C<pth_yield>(I<target>) also work across schedulers, but as I<asynchronous
+operations C<pth_cancel>, C<pth_abort>, C<pth_raise>, C<pth_suspend>,
+C<pth_resume> and C<pth_yield>(I<target>) also work across schedulers, but as
+I<asynchronous
 requests>: they are delivered to the target's home scheduler and take effect at
 that scheduler's next scheduling point, not necessarily immediately.
 
@@ -809,7 +810,7 @@ B<Cross-scheduler operation semantics.> Under M:N the synchronization objects
 (C<pth_mutex_t>, C<pth_cond_t>, C<pth_rwlock_t>, C<pth_barrier_t>), message
 ports, and C<pth_join>(3) operate correctly regardless of which scheduler owns
 the thread or object involved. The thread-control operations C<pth_cancel>(3),
-C<pth_raise>(3), C<pth_suspend>(3), C<pth_resume>(3) and
+C<pth_abort>(3), C<pth_raise>(3), C<pth_suspend>(3), C<pth_resume>(3) and
 C<pth_yield>(I<target>) additionally work when the target thread belongs to
 another scheduler, but there they behave as I<asynchronous requests>: the
 operation is forwarded to the target's home scheduler and applied at that
@@ -1019,6 +1020,13 @@ pth_once(3) by any thread in the system succeeds. The variable referenced via
 I<ctrlvar> should be declared as `C<pth_once_t> I<variable-name> =
 C<PTH_ONCE_INIT>;' before calling this function.
 
+This is safe under B<M:N> multi-scheduler operation: when several threads on
+different schedulers call pth_once(3) on the same I<ctrlvar> concurrently,
+exactly one runs I<func> while the others wait until it has completed. If I<func>
+does not complete because its thread is cancelled or exits non-locally, the
+control variable is reset as if pth_once(3) had never been called, so a
+subsequent call runs I<func> again.
+
 =item pth_t B<pth_self>(void);
 
 This just returns the unique thread handle of the currently running thread.
@@ -1125,7 +1133,9 @@ This is the cruel way to cancel a thread I<tid>. When it's already dead and
 waits to be joined it just joins it (via `C<pth_join(>I<tid>C<, NULL)>') and
 this way kicks it out of the system.  Else it forces the thread to be not
 joinable and to allow asynchronous cancellation and then cancels it via
-`C<pth_cancel(>I<tid>C<)>'.
+`C<pth_cancel(>I<tid>C<)>'. Under M:N, if I<tid> belongs to another scheduler
+the abort is forwarded to that scheduler and carried out there (an asynchronous
+request, like the other cross-scheduler thread-control operations above).
 
 =item int B<pth_join>(pth_t I<tid>, void **I<value>);
 
@@ -2482,7 +2492,7 @@ Under B<M:N> multi-scheduler mode (C<pth_mp_init>(3)) a few facilities remain
 tied to the first scheduler (scheduler 0, which runs the main thread):
 B<Pth>'s process-signal handling (C<PTH_EVENT_SIGS>, C<pth_sigwait>(3)) and
 C<pth_fork>(3); threads that use these must run on scheduler 0. Cross-scheduler
-C<pth_cancel>/C<pth_raise>/C<pth_suspend>/C<pth_resume>/C<pth_yield>(I<target>)
+C<pth_cancel>/C<pth_abort>/C<pth_raise>/C<pth_suspend>/C<pth_resume>/C<pth_yield>(I<target>)
 are applied asynchronously at the target scheduler's next scheduling point.
 C<pth_ctrl(PTH_CTRL_GETTHREADS)> and the load average are per-scheduler. The
 public synchronization structure layouts changed for M:N support, so clients
