@@ -44,7 +44,7 @@ option(PTH_SCHED_KQUEUE "Use kqueue(2) persistent readiness in the scheduler cor
 # BUILD_SHARED_LIBS selects static (default) vs shared library
 
 # mctx overrides (equivalent to --with-mctx-mth/dsp/stk); empty = autodetect
-set(PTH_MCTX_MTH "" CACHE STRING "Force mctx method (mcsc, sjlj)")
+set(PTH_MCTX_MTH "" CACHE STRING "Force mctx method (mcsc, sjlj, bctx)")
 set(PTH_MCTX_DSP "" CACHE STRING "Force mctx dispatching (sc, ssjlj, sjlj, usjlj, sjlje, sjljlx, sjljisc, sjljw32)")
 set(PTH_MCTX_STK "" CACHE STRING "Force mctx stack setup (mc, ss, sas, none)")
 
@@ -549,7 +549,7 @@ endif()
 if(PTH_BUILD_TESTS)
     enable_testing()
     foreach(t test_std test_mp test_misc test_philo test_sig
-              test_select test_httpd test_uctx test_sync test_mutexfair test_pollfd)
+              test_select test_httpd test_uctx test_sync test_mutexfair test_pollfd test_badfd test_closewait)
         add_executable(${t} ${t}.c test_common.c)
         target_link_libraries(${t} PRIVATE pth)
     endforeach()
@@ -566,7 +566,7 @@ if(PTH_BUILD_TESTS)
     endif()
     # Only test_std and test_uctx are self-terminating, non-interactive tests;
     # the others (mp, sig, philo, misc, select, httpd) are interactive demos.
-    foreach(t test_std test_uctx test_sync test_mutexfair test_pollfd)
+    foreach(t test_std test_uctx test_sync test_mutexfair test_pollfd test_badfd test_closewait)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES TIMEOUT 120)
     endforeach()

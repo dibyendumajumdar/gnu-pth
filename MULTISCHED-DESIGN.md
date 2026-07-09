@@ -956,7 +956,7 @@ method on Linux/x86_64; macOS is exercised via CI. (The autoconf build still
 selects `mcsc`/`sjlj` only; `bctx` is wired through the CMake build, which is the
 supported build for this fork.)
 
-## 23. Scalable fd readiness: the epoll(7) scheduler backend (opt-in, `PTH_SCHED_EPOLL`)
+## 23. Scalable fd readiness: the epoll(7)/kqueue(2) scheduler backends (default on Linux / *BSD·macOS)
 
 The `select(2)` and `poll(2)` scheduler cores (§12) both *rebuild and rescan the
 entire descriptor set on every scheduler pass*: a scheduler parked on N idle
@@ -997,15 +997,44 @@ being told. The commit path is therefore defensive: `MOD` returning `ENOENT`
 that fails outright (e.g. `EBADF`) marks the fd *ready* so the waiter's own I/O
 call returns the real error instead of blocking forever.
 
-**fd-reuse contract (limitation).** The one residual hazard is the same as every
-persistent-poller (libev's `ev_io_stop`, libevent): if an application closes a
-descriptor that a thread is *still waiting on* and immediately reuses the same
-number, on the same scheduler, with the *same* wait direction, all within one
-scheduler tick, a wakeup can be missed. Applications should not close descriptors
-out from under waiting threads (already true in general; only epoll is sensitive
-to reuse). The `select`/`poll` backends remain fully reuse-immune, so they stay
-the default; `PTH_SCHED_EPOLL` is strictly opt-in. A future `pth_close()` that
-evicts the fd from its scheduler's interest set would close this gap entirely.
+**close-while-waiting contract (limitation).** This is the same hazard every
+persistent-registration poller has, and why libev/libevent require an explicit
+unregister-before-close (`ev_io_stop`): if an application closes a descriptor
+that a Pth thread is *still waiting on*, the kernel silently drops it from the
+epoll/kqueue interest set, but the userspace cache still records it as
+registered with the wanted mask, so the event manager skips re-registering it
+and the waiter is never woken (a *strand*). Plain close-while-waiting is enough
+to trigger this -- it is broader than the same-tick fd-*reuse* special case. The
+hard contract for these backends is therefore: **a descriptor must not be closed
+while any Pth thread may still be waiting on it** (a bounded wait, i.e. one with
+a timeout, is unaffected -- it re-evaluates on timeout). The `select`/`poll`
+backends do not have this restriction: they rebuild the wait set every pass, so
+a closed descriptor surfaces as `POLLNVAL`/`EBADF` (`PTH_STATUS_FAILED`) and the
+waiter wakes with an error. They are retained as first-class, explicitly
+selectable, close-safe fallbacks (`-DPTH_SCHED_EPOLL=OFF` / `-DPTH_SCHED_KQUEUE=OFF`).
+
+**Bounded-revalidation safety net.** Rather than leave the default backend able
+to hang permanently, the evport backends run a revalidation heartbeat. A
+scheduler never blocks in `epoll_wait()`/`kevent()` longer than
+`PTH_SCHED_REVAL_MS` (default 1000 ms; set the environment variable to `0` to
+disable and get pure persistent registration), and once per interval it sets an
+internal *force* flag so the next commit re-asserts **every** current
+registration instead of skipping unchanged ones. A descriptor that was closed
+out from under a waiter then fails the re-assert (`epoll_ctl` `EBADF`, or a
+kqueue `EV_ERROR`); the stale cache entry is dropped and the waiter is woken
+with `PTH_STATUS_FAILED` (`EBADF`) -- the same outcome select/poll give, just
+bounded to at most one interval of latency instead of immediate. So a
+close-while-waiting bug degrades to a bounded delay, not a strand. The steady-
+state cost is one extra idle wakeup per interval per scheduler and an
+`O(registered)` re-assert once per interval (negligible next to the per-event
+work); the fast path on ordinary passes still skips unchanged registrations, so
+scalability is preserved. `test_closewait` exercises this (it strands, i.e.
+times out, with `PTH_SCHED_REVAL_MS=0` and passes with the default). A bad
+descriptor detected *at registration time* is handled directly: `pth_evp_*`
+flags it `PTH_STATUS_FAILED` (see `test_badfd`), matching select/poll. A fully
+immediate fix would still need Pth to intercept `close(2)` (a `pth_close()`
+wrapper or cross-scheduler fd eviction); that remains a possible future
+addition on top of the heartbeat.
 
 **No API/ABI impact.** This is a build-time backend selection only:
 `-DPTH_SCHED_EPOLL=ON` (Linux-only; it implies `PTH_SCHED_POLL` so the

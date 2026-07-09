@@ -222,6 +222,7 @@ static void pth_bctx_entry(pth_transfer_t tr)
 {
     pth_mctx_t *from = (pth_mctx_t *)tr.data;
     from->fc = tr.fctx;              /* record where the switcher suspended  */
+    errno = pth_bctx_self->error;    /* start with this context's saved errno */
     (*pth_bctx_self->func)();        /* run our own entry (never returns)    */
     abort();                         /* NOTREACHED */
 }
@@ -229,12 +230,17 @@ static void pth_bctx_entry(pth_transfer_t tr)
 intern void pth_mctx_switch_bctx(pth_mctx_t *old, pth_mctx_t *new)
 {
     pth_transfer_t tr;
+    /* errno is a per-OS-thread global, not part of the fcontext, so save/restore
+       it explicitly across the switch (as the mcsc/sjlj methods do via
+       mctx->error); otherwise it would leak between Pth threads */
+    old->error = errno;
     /* install the incoming context's real signal mask, saving ours (one
        syscall), exactly as swapcontext(2) would */
     pth_sc(sigprocmask)(SIG_SETMASK, &new->sysmask, &old->sysmask);
     pth_bctx_self = new;
     tr = jump_fcontext(new->fc, old);           /* -> new; resume here later */
     ((pth_mctx_t *)tr.data)->fc = tr.fctx;      /* record resumer's suspension */
+    errno = old->error;                         /* restore our errno on resume */
 }
 
 intern void pth_mctx_restore_bctx(pth_mctx_t *mctx)
@@ -242,6 +248,7 @@ intern void pth_mctx_restore_bctx(pth_mctx_t *mctx)
     /* jump to mctx and do not return here; the discarded continuation lands
        in the per-thread trash mctx */
     pth_sc(sigprocmask)(SIG_SETMASK, &mctx->sysmask, NULL);
+    errno = mctx->error;             /* restore target's errno (mcsc parity) */
     pth_bctx_self = mctx;
     (void)jump_fcontext(mctx->fc, &pth_bctx_trash);
     /* NOTREACHED */

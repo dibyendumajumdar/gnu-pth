@@ -378,3 +378,81 @@ selected the vendored x86_64 ELF fcontext assembly. The registered test set
 excluding the sandbox-sensitive `test_netio_mp` passed: 17/17 tests, including
 the MP scheduler, join, message-port, cancel/raise, suspend, once, epoll-scale,
 pthread-emulation, and bounded philosopher tests.
+
+---
+
+## Third Follow-up Resolution (epoll/kqueue backends)
+
+### High — persistent fd backend can strand waiters after close-while-waiting: FIXED (bounded safety net)
+The persistent-registration backends cannot see a *silent* kernel deregistration
+(the kernel drops a closed fd from the epoll/kqueue interest set without an
+event), so a descriptor closed while a thread is still waiting on it could
+strand that waiter. This is the same hazard every persistent poller has
+(libev/libevent require unregister-before-close). Rather than leave the now-
+default backend able to hang, a **bounded revalidation heartbeat** was added
+(`pth_sched.c`):
+
+* a scheduler never blocks in `epoll_wait()`/`kevent()` longer than
+  `PTH_SCHED_REVAL_MS` (env, default 1000 ms; `0` disables for pure persistent
+  behaviour), so an otherwise-idle scheduler still wakes periodically;
+* once per interval an internal *force* flag makes the next commit re-assert
+  **every** current registration instead of skipping unchanged ones;
+* a descriptor that vanished fails the re-assert (`epoll_ctl` `EBADF` / kqueue
+  `EV_ERROR`); the stale cache entry is dropped and the waiter is woken with
+  `PTH_STATUS_FAILED` (`EBADF`) — the select/poll outcome, bounded to at most
+  one interval of latency instead of a permanent strand.
+
+Steady-state cost is one idle wakeup per interval per scheduler plus an
+`O(registered)` re-assert once per interval; ordinary passes still skip
+unchanged registrations, so scalability is preserved. New `test_closewait.c`: a
+thread blocks in `pth_read()` on a socketpair end which is then closed out from
+under it. **With `PTH_SCHED_REVAL_MS=0` this strands (harness timeout); with the
+default it wakes with `EBADF`** — confirmed both ways, and it passes immediately
+on the close-safe `select`/`poll` backends. The design doc (§23) documents the
+contract, the safety net, and the knob; select/poll remain first-class,
+explicitly selectable, close-safe fallbacks. (A fully *immediate* fix would
+still need a `close(2)` interception / `pth_close()`; noted as possible future
+work on top of the heartbeat.)
+
+### Medium — evport bad-fd regresses PTH_EVENT_SELECT failure semantics: FIXED
+The evport cleanup now carries an explicit failure bit (`PTH_EVP_FAIL`).
+Registration failure for a bad descriptor (epoll `EPOLL_CTL_ADD` error, kqueue
+`EV_ERROR`) flags the fd failed rather than ready, and the cleanup maps it to
+`PTH_STATUS_FAILED` for both `PTH_EVENT_FD` and `PTH_EVENT_SELECT` — matching the
+`select`/`poll` `POLLNVAL` behaviour (a `pth_select()` on an invalid descriptor
+now fails instead of being reported ready, with no follow-up syscall needed).
+New `test_badfd.c` (`pth_select()` on a closed descriptor) returns `EBADF` on
+all four backends (select, poll, epoll, kqueue).
+
+### Low — backend default documentation internally stale: FIXED
+§23's title and body now describe epoll/kqueue as the *platform defaults*
+(epoll on Linux, kqueue on \*BSD/macOS) rather than "opt-in", consistent with the
+CMake logic and the defaults note.
+
+### Third Follow-up Verification (Linux)
+Rebuilt the default epoll backend plus poll and select. The full MP suite
+(`test_mpsched`, `test_join_mp`, `test_msgport_mp`, `test_cancelraise_mp`,
+`test_suspend_mp`, `test_cancelblock_mp`, `test_once_mp`, `test_netio_mp`,
+`test_epoll_scale`, `test_philo mp`) plus the two new `test_badfd` and
+`test_closewait` pass on epoll; `test_closewait` was confirmed to strand
+(timeout) with the safety net disabled. No regression on poll/select/single.
+kqueue paths are syntax-checked locally (fake `<sys/event.h>`, with and without
+`EVFILT_EXCEPT`) and built/run via the FreeBSD/macOS CI.
+
+---
+
+## Fourth Follow-up Resolution (Boost.Context bctx)
+
+### Medium — bctx does not preserve errno across context switches: FIXED
+`pth_mctx_switch_bctx()` now saves `old->error = errno` before `jump_fcontext()`
+and restores `errno = old->error` when the context is resumed;
+`pth_mctx_restore_bctx()` sets `errno = mctx->error` before its non-returning
+jump; and the fresh-context trampoline (`pth_bctx_entry`) installs
+`errno = self->error` before entering the thread body. This mirrors the mcsc/sjlj
+`mctx->error` save/restore contract, so `errno` no longer leaks between Pth
+threads or `pth_uctx` contexts under the bctx method. Verified with a forced
+bctx build (vendored x86_64 ELF fcontext asm) running the MP suite +
+`test_netio_mp` + `test_epoll_scale` + `test_badfd`.
+
+### Low — CMake cache help omits bctx: FIXED
+The `PTH_MCTX_MTH` cache help now reads `"Force mctx method (mcsc, sjlj, bctx)"`.

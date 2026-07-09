@@ -123,6 +123,9 @@ struct pth_gsched_st {
     int          evp_reglistcap;
     void        *evp_evs;       /* epoll_wait() result buffer             */
     int          evp_evcap;
+    int          evp_force;     /* re-assert every registration this pass */
+    int          evp_reval_ms;  /* revalidation heartbeat, ms (0 disables)*/
+    pth_time_t   evp_nextreval; /* next revalidation time point           */
 #endif
 };
 
@@ -1262,6 +1265,7 @@ intern void pth_sched_eventmanager_poll(pth_time_t *now, int dopoll)
 #define PTH_EVP_R 0x1
 #define PTH_EVP_W 0x2
 #define PTH_EVP_E 0x4
+#define PTH_EVP_FAIL 0x8   /* registration failed (bad descriptor) */
 
 struct pth_evreg_st {
     unsigned int  gen;        /* pass this fd was last wanted in            */
@@ -1313,6 +1317,7 @@ static void pth_evp_begin(pth_gsched_t *g)
 {
     g->evp_gen++;
     g->evp_ntouched = 0;
+    g->evp_force = FALSE;
     if (g->evp_gen == 0) {           /* generation wrapped: invalidate cache */
         int i;
         for (i = 0; i < g->evp_regcap; i++) {
@@ -1389,13 +1394,14 @@ static void pth_evp_ctl(pth_gsched_t *g, int fd, struct pth_evreg_st *r)
             }
         }
         else {
-            /* bad descriptor etc.: report ready so the waiter's own I/O call
-               returns the real error instead of blocking forever */
-            r->ready  = r->want;
+            /* bad descriptor at registration: flag FAILED so pth_select() and
+               pth_read()/pth_write() wake with an error (the poll(2) POLLNVAL
+               semantics) instead of blocking forever */
+            r->ready  = PTH_EVP_FAIL;
             r->rdygen = g->evp_gen;
         }
     }
-    else if (r->regmask != r->want) {
+    else if (r->regmask != r->want || g->evp_force) {
         if (epoll_ctl(g->evp_fd, EPOLL_CTL_MOD, fd, &ee) == 0)
             r->regmask = r->want;
         else if (errno == ENOENT) {
@@ -1403,6 +1409,18 @@ static void pth_evp_ctl(pth_gsched_t *g, int fd, struct pth_evreg_st *r)
                dropped the old registration, so add the new one afresh */
             if (epoll_ctl(g->evp_fd, EPOLL_CTL_ADD, fd, &ee) == 0)
                 r->regmask = r->want;
+            else {
+                r->registered = 0; r->regmask = 0;
+                r->ready = PTH_EVP_FAIL; r->rdygen = g->evp_gen;
+            }
+        }
+        else {
+            /* the descriptor is gone -- e.g. closed while still being waited on
+               -- so the kernel silently dropped it. Drop the stale cache entry
+               and wake the waiter with FAILED. Caught on the revalidation pass
+               (g->evp_force) even when nothing else changed. */
+            r->registered = 0; r->regmask = 0;
+            r->ready = PTH_EVP_FAIL; r->rdygen = g->evp_gen;
         }
     }
 }
@@ -1417,8 +1435,9 @@ static void pth_evp_commit(pth_gsched_t *g)
     for (i = 0; i < g->evp_nreg; ) {
         int fd = g->evp_reglist[i];
         struct pth_evreg_st *r = &g->evp_reg[fd];
-        if (r->gen != g->evp_gen) {
-            epoll_ctl(g->evp_fd, EPOLL_CTL_DEL, fd, NULL);
+        if (r->gen != g->evp_gen || !r->registered) {
+            if (r->registered)
+                epoll_ctl(g->evp_fd, EPOLL_CTL_DEL, fd, NULL);
             r->registered = 0;
             r->regmask = 0;
             g->evp_reglist[i] = g->evp_reglist[--g->evp_nreg];
@@ -1495,9 +1514,11 @@ static void pth_evp_kq_apply(pth_gsched_t *g, struct kevent *ch, int nch)
             /* data==0 is a success ack; ENOENT is a benign delete-miss */
             if (res[k].data == 0 || res[k].data == ENOENT)
                 continue;
-            bit = 0;
-            if (res[k].filter == EVFILT_READ)  bit |= PTH_EVP_R;
-            if (res[k].filter == EVFILT_WRITE) bit |= PTH_EVP_W;
+            /* the descriptor is gone (bad fd, or closed while waited on):
+               flag FAILED (POLLNVAL parity) and drop the dead registration */
+            bit = PTH_EVP_FAIL;
+            g->evp_reg[fd].registered = 0;
+            g->evp_reg[fd].regmask = 0;
         }
         else {
             bit = 0;
@@ -1539,12 +1560,12 @@ static void pth_evp_commit(pth_gsched_t *g)
         r  = &g->evp_reg[fd];
         want = r->want;
         have = r->registered ? r->regmask : 0;
-        if ( (want & PTH_EVP_R) && !(have & PTH_EVP_R)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_READ,  EV_ADD);
+        if ( (want & PTH_EVP_R) && (!(have & PTH_EVP_R) || g->evp_force)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_READ,  EV_ADD);
         if (!(want & PTH_EVP_R) &&  (have & PTH_EVP_R)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_READ,  EV_DELETE);
-        if ( (want & PTH_EVP_W) && !(have & PTH_EVP_W)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_WRITE, EV_ADD);
+        if ( (want & PTH_EVP_W) && (!(have & PTH_EVP_W) || g->evp_force)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_WRITE, EV_ADD);
         if (!(want & PTH_EVP_W) &&  (have & PTH_EVP_W)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_WRITE, EV_DELETE);
 #ifdef EVFILT_EXCEPT
-        if ( (want & PTH_EVP_E) && !(have & PTH_EVP_E)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_EXCEPT, EV_ADD);
+        if ( (want & PTH_EVP_E) && (!(have & PTH_EVP_E) || g->evp_force)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_EXCEPT, EV_ADD);
         if (!(want & PTH_EVP_E) &&  (have & PTH_EVP_E)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_EXCEPT, EV_DELETE);
 #endif
         if (!r->registered) {
@@ -1557,7 +1578,7 @@ static void pth_evp_commit(pth_gsched_t *g)
     for (i = 0; i < g->evp_nreg; ) {
         fd = g->evp_reglist[i];
         r  = &g->evp_reg[fd];
-        if (r->gen != g->evp_gen) {
+        if (r->gen != g->evp_gen || !r->registered) {
             if (r->regmask & PTH_EVP_R) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_READ,  EV_DELETE);
             if (r->regmask & PTH_EVP_W) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_WRITE, EV_DELETE);
 #ifdef EVFILT_EXCEPT
@@ -1643,6 +1664,17 @@ intern int pth_evp_init(pth_gsched_t *g)
     g->evp_touched = NULL; g->evp_ntouched = 0;    g->evp_touchedcap = 0;
     g->evp_reglist = NULL; g->evp_nreg = 0;        g->evp_reglistcap = 0;
     g->evp_evs = NULL;     g->evp_evcap = 0;
+    g->evp_force = FALSE;
+    {
+        /* bounded revalidation heartbeat: periodically re-assert every
+           registration so a descriptor closed while a thread is still
+           waiting on it is detected and the waiter woken with EBADF,
+           rather than stranded (persistent registration cannot otherwise
+           notice a silent kernel deregistration). 0 disables it. */
+        const char *e = getenv("PTH_SCHED_REVAL_MS");
+        g->evp_reval_ms = (e != NULL ? atoi(e) : 1000);
+    }
+    pth_time_set(&g->evp_nextreval, PTH_TIME_ZERO);
     return TRUE;
 }
 
@@ -1869,6 +1901,13 @@ intern void pth_sched_eventmanager_evport(pth_time_t *now, int dopoll)
     /* let poll() wait for the read-part of the signal pipe
        (it was already cleared at the top of this event loop) */
     pth_evp_want(g, g->sigpipe[0], PTH_EVP_R);
+    if (g->evp_reval_ms > 0 && pth_time_cmp(now, &g->evp_nextreval) >= 0) {
+        pth_time_t _iv = pth_time(g->evp_reval_ms / 1000,
+                                  (long)(g->evp_reval_ms % 1000) * 1000);
+        g->evp_force = TRUE;                    /* re-assert all this pass */
+        pth_time_set(&g->evp_nextreval, now);
+        pth_time_add(&g->evp_nextreval, &_iv);
+    }
     pth_evp_commit(g);
 
     /* replace signal actions for signals we've to catch for events
@@ -1904,6 +1943,10 @@ intern void pth_sched_eventmanager_evport(pth_time_t *now, int dopoll)
         }
         else
             ptimeout = -1;   /* block indefinitely */
+        /* never block past the revalidation heartbeat, so a scheduler that is
+           otherwise idle still periodically re-checks its registrations */
+        if (g->evp_reval_ms > 0 && (ptimeout < 0 || ptimeout > g->evp_reval_ms))
+            ptimeout = g->evp_reval_ms;
         rc = pth_evp_wait(g, ptimeout);
     }
 
@@ -1970,16 +2013,22 @@ intern void pth_sched_eventmanager_evport(pth_time_t *now, int dopoll)
                                        "[I/O] event occurred for thread \"%s\"", t->name);
                             ev->ev_status = PTH_STATUS_OCCURRED;
                         }
+                        else if (re & PTH_EVP_FAIL) {
+                            /* registration failed (bad descriptor) */
+                            ev->ev_status = PTH_STATUS_FAILED;
+                        }
                     }
                     /* Filedescriptor Set I/O */
                     else if (ev->ev_type == PTH_EVENT_SELECT) {
                         fd_set trfds, twfds, tefds;
-                        int sfd;
+                        int sfd, bad = FALSE;
                         FD_ZERO(&trfds); FD_ZERO(&twfds); FD_ZERO(&tefds);
                         for (sfd = 0; sfd < ev->ev_args.SELECT.nfd; sfd++) {
                             short re = pth_evp_ready(g, sfd);
                             if (re == 0)
                                 continue;
+                            if (re & PTH_EVP_FAIL)
+                                bad = TRUE;
                             if ((re & PTH_EVP_R) && ev->ev_args.SELECT.rfds
                                 && FD_ISSET(sfd, ev->ev_args.SELECT.rfds))  FD_SET(sfd, &trfds);
                             if ((re & PTH_EVP_W) && ev->ev_args.SELECT.wfds
@@ -2000,6 +2049,12 @@ intern void pth_sched_eventmanager_evport(pth_time_t *now, int dopoll)
                             ev->ev_status = PTH_STATUS_OCCURRED;
                             pth_debug2("pth_sched_eventmanager: "
                                        "[I/O] event occurred for thread \"%s\"", t->name);
+                        }
+                        else if (bad) {
+                            /* only invalid descriptors were seen: fail the select */
+                            ev->ev_status = PTH_STATUS_FAILED;
+                            pth_debug2("pth_sched_eventmanager: "
+                                       "[I/O] event failed for thread \"%s\"", t->name);
                         }
                     }
                     /* Signal Set */
