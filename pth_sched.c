@@ -110,8 +110,8 @@ struct pth_gsched_st {
     unsigned long osthread;    /* pthread_t of the scheduler's OS thread */
     pth_atomic_t boot_done;    /* bootstrap finished flag                */
     int          boot_rc;      /* bootstrap result                       */
-#ifdef PTH_SCHED_EPOLL
-    int          evp_fd;        /* epoll(7) instance for this scheduler   */
+#if defined(PTH_SCHED_EPOLL) || defined(PTH_SCHED_KQUEUE)
+    int          evp_fd;        /* epoll/kqueue instance for this scheduler*/
     struct pth_evreg_st *evp_reg;/* fd-indexed registration cache         */
     int          evp_regcap;    /* slots allocated in evp_reg             */
     unsigned int evp_gen;       /* current event-manager pass generation  */
@@ -198,7 +198,7 @@ intern int pth_scheduler_init(void)
         return pth_error(FALSE, errno);
     if (pth_fdmode(g->sigpipe[1], PTH_FDMODE_NONBLOCK) == PTH_FDMODE_ERROR)
         return pth_error(FALSE, errno);
-#ifdef PTH_SCHED_EPOLL
+#if defined(PTH_SCHED_EPOLL) || defined(PTH_SCHED_KQUEUE)
     if (!pth_evp_init(g))
         return pth_error(FALSE, errno);
 #endif
@@ -273,7 +273,7 @@ intern void pth_scheduler_kill(void)
     pth_scheduler_drop();
 
     /* remove the internal signal pipe */
-#ifdef PTH_SCHED_EPOLL
+#if defined(PTH_SCHED_EPOLL) || defined(PTH_SCHED_KQUEUE)
     pth_evp_kill(g);
 #endif
     close(g->sigpipe[0]);
@@ -1235,20 +1235,29 @@ intern void pth_sched_eventmanager_poll(pth_time_t *now, int dopoll)
 
 #endif /* PTH_SCHED_POLL */
 
-#ifdef PTH_SCHED_EPOLL
+#if defined(PTH_SCHED_EPOLL) || defined(PTH_SCHED_KQUEUE)
 /*
- * epoll(7)-based fd readiness for the scheduler core (opt-in via
- * -DPTH_SCHED_EPOLL, which also switches on the poll(2) fast paths).  Where
- * select(2)/poll(2) rebuild and rescan the whole descriptor set on every
- * scheduler pass, epoll keeps a *persistent* interest set in the kernel: a
- * scheduler with N idle waiters no longer costs an N-descriptor kernel scan
- * each pass -- epoll_wait() returns only the ready descriptors.  Each
- * scheduler owns its own epoll instance plus an fd-indexed registration
- * cache; the cache is diffed against the waiting queue each pass so only
- * genuine changes reach epoll_ctl().  See MULTISCHED-DESIGN.md section 23.
+ * Persistent-registration fd readiness for the scheduler core (opt-in via
+ * -DPTH_SCHED_EPOLL on Linux or -DPTH_SCHED_KQUEUE on *BSD/macOS; either flag
+ * also switches on the poll(2) fast paths). Where select(2)/poll(2) rebuild and
+ * rescan the whole descriptor set on every scheduler pass, epoll/kqueue keep a
+ * *persistent* interest set in the kernel: a scheduler with N idle waiters no
+ * longer costs an N-descriptor kernel scan each pass -- the wait returns only
+ * the ready descriptors. Each scheduler owns its own epoll/kqueue instance plus
+ * an fd-indexed registration cache diffed against the waiting queue each pass,
+ * so only genuine changes reach the kernel. The event manager below
+ * (pth_sched_eventmanager_evport) is backend-agnostic; only the small pth_evp_*
+ * primitives (commit/wait/osfd) differ between epoll and kqueue. See
+ * MULTISCHED-DESIGN.md section 23.
  */
-#include <sys/epoll.h>
 #include <fcntl.h>
+#if defined(PTH_SCHED_EPOLL)
+#include <sys/epoll.h>
+#elif defined(PTH_SCHED_KQUEUE)
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
 
 #define PTH_EVP_R 0x1
 #define PTH_EVP_W 0x2
@@ -1263,23 +1272,7 @@ struct pth_evreg_st {
     unsigned char registered; /* currently in the kernel interest set       */
 };
 
-static int pth_evp_to_epoll(short m)
-{
-    int e = 0;
-    if (m & PTH_EVP_R) e |= EPOLLIN;
-    if (m & PTH_EVP_W) e |= EPOLLOUT;
-    if (m & PTH_EVP_E) e |= EPOLLPRI;
-    return e;
-}
-
-static short pth_evp_from_epoll(int e)
-{
-    short m = 0;
-    if (e & (EPOLLIN |EPOLLHUP|EPOLLERR)) m |= PTH_EVP_R;
-    if (e & (EPOLLOUT|EPOLLHUP|EPOLLERR)) m |= PTH_EVP_W;
-    if (e & EPOLLPRI)                     m |= PTH_EVP_E;
-    return m;
-}
+/* ---- generic registration-cache bookkeeping (backend independent) ------- */
 
 static int pth_evp_grow_reg(pth_gsched_t *g, int fd)
 {
@@ -1347,6 +1340,34 @@ static int pth_evp_want(pth_gsched_t *g, int fd, short mask)
     return TRUE;
 }
 
+static short pth_evp_ready(pth_gsched_t *g, int fd)
+{
+    if (fd >= 0 && fd < g->evp_regcap && g->evp_reg[fd].rdygen == g->evp_gen)
+        return g->evp_reg[fd].ready;
+    return 0;
+}
+
+#if defined(PTH_SCHED_EPOLL)
+/* ---- epoll(7) backend --------------------------------------------------- */
+
+static int pth_evp_to_epoll(short m)
+{
+    int e = 0;
+    if (m & PTH_EVP_R) e |= EPOLLIN;
+    if (m & PTH_EVP_W) e |= EPOLLOUT;
+    if (m & PTH_EVP_E) e |= EPOLLPRI;
+    return e;
+}
+
+static short pth_evp_from_epoll(int e)
+{
+    short m = 0;
+    if (e & (EPOLLIN |EPOLLHUP|EPOLLERR)) m |= PTH_EVP_R;
+    if (e & (EPOLLOUT|EPOLLHUP|EPOLLERR)) m |= PTH_EVP_W;
+    if (e & EPOLLPRI)                     m |= PTH_EVP_E;
+    return m;
+}
+
 static void pth_evp_ctl(pth_gsched_t *g, int fd, struct pth_evreg_st *r)
 {
     struct epoll_event ee;
@@ -1389,12 +1410,10 @@ static void pth_evp_ctl(pth_gsched_t *g, int fd, struct pth_evreg_st *r)
 static void pth_evp_commit(pth_gsched_t *g)
 {
     int i;
-    /* ADD/MOD everything wanted this pass */
     for (i = 0; i < g->evp_ntouched; i++) {
         int fd = g->evp_touched[i];
         pth_evp_ctl(g, fd, &g->evp_reg[fd]);
     }
-    /* DEL everything still registered but no longer wanted (swap-remove) */
     for (i = 0; i < g->evp_nreg; ) {
         int fd = g->evp_reglist[i];
         struct pth_evreg_st *r = &g->evp_reg[fd];
@@ -1438,23 +1457,188 @@ static int pth_evp_wait(pth_gsched_t *g, int timeout_ms)
     return n;
 }
 
-static short pth_evp_ready(pth_gsched_t *g, int fd)
+static int pth_evp_osfd(void)
 {
-    if (fd >= 0 && fd < g->evp_regcap && g->evp_reg[fd].rdygen == g->evp_gen)
-        return g->evp_reg[fd].ready;
-    return 0;
+    int fd = epoll_create1(EPOLL_CLOEXEC);
+    if (fd < 0) {
+        /* older kernels without epoll_create1(2) */
+        fd = epoll_create(256);
+        if (fd >= 0)
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    return fd;
 }
+
+#elif defined(PTH_SCHED_KQUEUE)
+/* ---- kqueue(2) backend (*BSD / macOS) ----------------------------------- */
+
+/* submit a batch of changes; absorb EV_ERROR (mark bad fds ready so the
+   waiter's own I/O returns the error) and stamp any readiness delivered while
+   applying (kqueue is level-triggered, so it would be re-reported anyway) */
+static void pth_evp_kq_apply(pth_gsched_t *g, struct kevent *ch, int nch)
+{
+    struct kevent res[128];
+    struct timespec zero;
+    int n, k, fd;
+    short bit;
+    if (nch <= 0)
+        return;
+    zero.tv_sec = 0; zero.tv_nsec = 0;
+    n = kevent(g->evp_fd, ch, nch, res, (int)(sizeof(res)/sizeof(res[0])), &zero);
+    if (n <= 0)
+        return;
+    for (k = 0; k < n; k++) {
+        fd = (int)res[k].ident;
+        if (fd < 0 || fd >= g->evp_regcap)
+            continue;
+        if (res[k].flags & EV_ERROR) {
+            /* data==0 is a success ack; ENOENT is a benign delete-miss */
+            if (res[k].data == 0 || res[k].data == ENOENT)
+                continue;
+            bit = 0;
+            if (res[k].filter == EVFILT_READ)  bit |= PTH_EVP_R;
+            if (res[k].filter == EVFILT_WRITE) bit |= PTH_EVP_W;
+        }
+        else {
+            bit = 0;
+            if (res[k].filter == EVFILT_READ)  bit |= PTH_EVP_R;
+            else if (res[k].filter == EVFILT_WRITE) bit |= PTH_EVP_W;
+#ifdef EVFILT_EXCEPT
+            else if (res[k].filter == EVFILT_EXCEPT) bit |= PTH_EVP_E;
+#endif
+            if (res[k].flags & EV_EOF) bit |= (PTH_EVP_R|PTH_EVP_W);
+        }
+        if (g->evp_reg[fd].rdygen != g->evp_gen) {
+            g->evp_reg[fd].ready = 0;
+            g->evp_reg[fd].rdygen = g->evp_gen;
+        }
+        g->evp_reg[fd].ready |= bit;
+    }
+}
+
+static void pth_evp_kq_push(pth_gsched_t *g, struct kevent *ch, int *nch,
+                            int fd, int filter, int flags)
+{
+    if (*nch >= 64) {
+        pth_evp_kq_apply(g, ch, *nch);
+        *nch = 0;
+    }
+    EV_SET(&ch[*nch], fd, filter, flags, 0, 0, NULL);
+    (*nch)++;
+}
+
+static void pth_evp_commit(pth_gsched_t *g)
+{
+    struct kevent ch[64];
+    int nch = 0, i, fd;
+    struct pth_evreg_st *r;
+    short want, have;
+    /* ADD/DELETE individual filters for everything wanted this pass */
+    for (i = 0; i < g->evp_ntouched; i++) {
+        fd = g->evp_touched[i];
+        r  = &g->evp_reg[fd];
+        want = r->want;
+        have = r->registered ? r->regmask : 0;
+        if ( (want & PTH_EVP_R) && !(have & PTH_EVP_R)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_READ,  EV_ADD);
+        if (!(want & PTH_EVP_R) &&  (have & PTH_EVP_R)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_READ,  EV_DELETE);
+        if ( (want & PTH_EVP_W) && !(have & PTH_EVP_W)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_WRITE, EV_ADD);
+        if (!(want & PTH_EVP_W) &&  (have & PTH_EVP_W)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_WRITE, EV_DELETE);
+#ifdef EVFILT_EXCEPT
+        if ( (want & PTH_EVP_E) && !(have & PTH_EVP_E)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_EXCEPT, EV_ADD);
+        if (!(want & PTH_EVP_E) &&  (have & PTH_EVP_E)) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_EXCEPT, EV_DELETE);
+#endif
+        if (!r->registered) {
+            r->registered = 1;
+            pth_evp_push(&g->evp_reglist, &g->evp_nreg, &g->evp_reglistcap, fd);
+        }
+        r->regmask = want;
+    }
+    /* DELETE every filter for fds no longer wanted (swap-remove from reglist) */
+    for (i = 0; i < g->evp_nreg; ) {
+        fd = g->evp_reglist[i];
+        r  = &g->evp_reg[fd];
+        if (r->gen != g->evp_gen) {
+            if (r->regmask & PTH_EVP_R) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_READ,  EV_DELETE);
+            if (r->regmask & PTH_EVP_W) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_WRITE, EV_DELETE);
+#ifdef EVFILT_EXCEPT
+            if (r->regmask & PTH_EVP_E) pth_evp_kq_push(g, ch, &nch, fd, EVFILT_EXCEPT, EV_DELETE);
+#endif
+            r->registered = 0;
+            r->regmask = 0;
+            g->evp_reglist[i] = g->evp_reglist[--g->evp_nreg];
+        }
+        else
+            i++;
+    }
+    pth_evp_kq_apply(g, ch, nch);
+}
+
+static int pth_evp_wait(pth_gsched_t *g, int timeout_ms)
+{
+    struct kevent *evs;
+    struct timespec ts, *pts;
+    int n, i, fd, need;
+    short bit;
+    need = g->evp_nreg * 3 + 1;   /* up to R+W+E filters per registered fd */
+    if (need > g->evp_evcap) {
+        int nc = (g->evp_evcap == 0 ? 64 : g->evp_evcap);
+        struct kevent *ne;
+        while (nc < need)
+            nc *= 2;
+        ne = (struct kevent *)realloc(g->evp_evs, nc * sizeof(struct kevent));
+        if (ne != NULL) { g->evp_evs = ne; g->evp_evcap = nc; }
+    }
+    if (g->evp_evcap == 0)
+        return 0;
+    if (timeout_ms < 0)
+        pts = NULL;
+    else {
+        ts.tv_sec  = timeout_ms / 1000;
+        ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+        pts = &ts;
+    }
+    while ((n = kevent(g->evp_fd, NULL, 0, (struct kevent *)g->evp_evs,
+                       g->evp_evcap, pts)) < 0 && errno == EINTR) ;
+    if (n > 0) {
+        evs = (struct kevent *)g->evp_evs;
+        for (i = 0; i < n; i++) {
+            fd  = (int)evs[i].ident;
+            bit = 0;
+            if (evs[i].filter == EVFILT_READ)  bit |= PTH_EVP_R;
+            else if (evs[i].filter == EVFILT_WRITE) bit |= PTH_EVP_W;
+#ifdef EVFILT_EXCEPT
+            else if (evs[i].filter == EVFILT_EXCEPT) bit |= PTH_EVP_E;
+#endif
+            if (evs[i].flags & EV_EOF) bit |= (PTH_EVP_R|PTH_EVP_W);
+            if (fd >= 0 && fd < g->evp_regcap) {
+                if (g->evp_reg[fd].rdygen != g->evp_gen) {
+                    g->evp_reg[fd].ready = 0;
+                    g->evp_reg[fd].rdygen = g->evp_gen;
+                }
+                g->evp_reg[fd].ready |= bit;
+            }
+        }
+    }
+    return n;
+}
+
+static int pth_evp_osfd(void)
+{
+    int fd = kqueue();
+    if (fd >= 0)
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
+#endif /* backend */
+
+/* ---- generic instance lifecycle ----------------------------------------- */
 
 intern int pth_evp_init(pth_gsched_t *g)
 {
-    g->evp_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (g->evp_fd < 0) {
-        /* older kernels without epoll_create1(2) */
-        g->evp_fd = epoll_create(256);
-        if (g->evp_fd < 0)
-            return FALSE;
-        fcntl(g->evp_fd, F_SETFD, FD_CLOEXEC);
-    }
+    g->evp_fd = pth_evp_osfd();
+    if (g->evp_fd < 0)
+        return FALSE;
     g->evp_reg = NULL;     g->evp_regcap = 0;      g->evp_gen = 0;
     g->evp_touched = NULL; g->evp_ntouched = 0;    g->evp_touchedcap = 0;
     g->evp_reglist = NULL; g->evp_nreg = 0;        g->evp_reglistcap = 0;
@@ -1880,14 +2064,14 @@ intern void pth_sched_eventmanager_evport(pth_time_t *now, int dopoll)
     pth_debug1("pth_sched_eventmanager: leaving");
     return;
 }
-#endif /* PTH_SCHED_EPOLL */
+#endif /* PTH_SCHED_EPOLL || PTH_SCHED_KQUEUE */
 
 
 /* fd-wait backend dispatcher: poll(2) when built with -DPTH_SCHED_POLL,
    the classic select(2) path otherwise (both share all non-fd logic) */
 intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
 {
-#if defined(PTH_SCHED_EPOLL)
+#if defined(PTH_SCHED_EPOLL) || defined(PTH_SCHED_KQUEUE)
     pth_sched_eventmanager_evport(now, dopoll);
 #elif defined(PTH_SCHED_POLL)
     pth_sched_eventmanager_poll(now, dopoll);

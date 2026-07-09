@@ -49,6 +49,9 @@ jobs:
           - name: "macos / MP + poll + pthread (bctx)"
             os: macos-latest
             opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+          - name: "macos / MP + kqueue + pthread (bctx)"
+            os: macos-latest
+            opts: "-DPTH_MP=ON -DPTH_SCHED_KQUEUE=ON -DPTH_BUILD_PTHREAD=ON"
     steps:
       - uses: actions/checkout@v4
       - name: Configure
@@ -68,6 +71,8 @@ jobs:
         include:
           - name: "freebsd / MP + poll + pthread"
             opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+          - name: "freebsd / MP + kqueue + pthread"
+            opts: "-DPTH_MP=ON -DPTH_SCHED_KQUEUE=ON -DPTH_BUILD_PTHREAD=ON"
           - name: "freebsd / single-scheduler"
             opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
     steps:

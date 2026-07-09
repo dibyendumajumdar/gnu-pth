@@ -1022,6 +1022,23 @@ wakes each selectively with its own byte, and then repeats after closing and
 reopening every socketpair (reusing the descriptor numbers) to drive the
 self-healing `epoll_ctl` paths. `test_epoll_scale` is backend-agnostic and also
 passes under `poll`/`select`. A `linux / MP + epoll + pthread` CI configuration
-builds and runs it on every push. `kqueue(2)` for FreeBSD/macOS is the planned
-follow-up: it reuses `evport` unchanged, implementing only the `pth_evp_*`
-primitives (`kevent` in place of `epoll_ctl`/`epoll_wait`).
+builds and runs it on every push.
+
+**kqueue(2) backend (`PTH_SCHED_KQUEUE`, \*BSD/macOS).** The design paid off:
+the whole event manager and the generic cache bookkeeping are backend-agnostic,
+so kqueue reuses `evport` unchanged and supplies only its own `pth_evp_commit`
+/ `pth_evp_wait` / `pth_evp_osfd` primitives. The one structural difference is
+that kqueue registers each `(fd, filter)` separately (`EVFILT_READ`,
+`EVFILT_WRITE`, and `EVFILT_EXCEPT` for the exception/`PTH_UNTIL_FD_EXCEPTION`
+goal where available), rather than one combined mask per fd as epoll does, so
+the commit diffs and adds/deletes individual filters (batched through the
+`kevent` changelist); `EV_EOF` is mapped to both readable and writable so a
+peer hangup wakes readers and writers alike. Bad-descriptor and stale-filter
+errors are absorbed from the changelist's `EV_ERROR` results the same way epoll
+self-heals. `PTH_SCHED_KQUEUE` is opt-in, \*BSD/macOS-only, implies
+`PTH_SCHED_POLL`, and is mutually exclusive with `PTH_SCHED_EPOLL`. It is built
+and the full suite (including `test_epoll_scale`) is run on every push via the
+`macos / MP + kqueue + pthread` and `freebsd / MP + kqueue + pthread` CI
+configurations. (Exception/out-of-band waits require `EVFILT_EXCEPT`, present on
+macOS and FreeBSD 11+; read/write readiness -- the overwhelmingly common case --
+needs only the universal `EVFILT_READ`/`EVFILT_WRITE`.)
