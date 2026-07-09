@@ -26,8 +26,21 @@ option(PTH_SYSCALL_SOFT  "Enable soft system call mapping"            OFF)
 option(PTH_SYSCALL_HARD  "Enable hard system call mapping"            OFF)
 option(PTH_MP            "Enable multi-scheduler (multi-CPU) support" ON)
 option(PTH_SCHED_POLL   "Use poll(2) not select(2) in the scheduler core (no FD_SETSIZE ceiling)" ON)
-option(PTH_SCHED_EPOLL  "Use epoll(7) persistent readiness in the scheduler core (Linux only; implies PTH_SCHED_POLL; scales to many idle fds)" OFF)
-option(PTH_SCHED_KQUEUE "Use kqueue(2) persistent readiness in the scheduler core (*BSD/macOS only; implies PTH_SCHED_POLL; scales to many idle fds)" OFF)
+# The scalable readiness backend defaults to the platform-native one: epoll(7)
+# on Linux, kqueue(2) on *BSD/macOS. Fall back with -DPTH_SCHED_EPOLL=OFF /
+# -DPTH_SCHED_KQUEUE=OFF (leaving PTH_SCHED_POLL for poll(2), or all OFF for select(2)).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_epoll_default ON)
+    set(_kqueue_default OFF)
+elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin|BSD|DragonFly")
+    set(_epoll_default OFF)
+    set(_kqueue_default ON)
+else()
+    set(_epoll_default OFF)
+    set(_kqueue_default OFF)
+endif()
+option(PTH_SCHED_EPOLL  "Use epoll(7) persistent readiness in the scheduler core (Linux only; implies PTH_SCHED_POLL; scales to many idle fds)" ${_epoll_default})
+option(PTH_SCHED_KQUEUE "Use kqueue(2) persistent readiness in the scheduler core (*BSD/macOS only; implies PTH_SCHED_POLL; scales to many idle fds)" ${_kqueue_default})
 # BUILD_SHARED_LIBS selects static (default) vs shared library
 
 # mctx overrides (equivalent to --with-mctx-mth/dsp/stk); empty = autodetect

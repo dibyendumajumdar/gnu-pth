@@ -29,26 +29,26 @@ jobs:
           # Linux (Ubuntu)
           - name: "linux / MP + poll + pthread"
             os: ubuntu-latest
-            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_SCHED_EPOLL=OFF -DPTH_BUILD_PTHREAD=ON"
           - name: "linux / MP + select"
             os: ubuntu-latest
-            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=OFF -DPTH_BUILD_PTHREAD=ON"
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=OFF -DPTH_SCHED_EPOLL=OFF -DPTH_BUILD_PTHREAD=ON"
           - name: "linux / single-scheduler"
             os: ubuntu-latest
-            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
+            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF -DPTH_SCHED_EPOLL=OFF"
           - name: "linux / MP + epoll + pthread"
             os: ubuntu-latest
             opts: "-DPTH_MP=ON -DPTH_SCHED_EPOLL=ON -DPTH_BUILD_PTHREAD=ON"
           - name: "linux / MP + Boost.Context (bctx)"
             os: ubuntu-latest
-            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON -DPTH_MCTX_MTH=bctx"
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_SCHED_EPOLL=OFF -DPTH_BUILD_PTHREAD=ON -DPTH_MCTX_MTH=bctx"
           # macOS
           - name: "macos / single-scheduler"
             os: macos-latest
-            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
+            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF -DPTH_SCHED_KQUEUE=OFF"
           - name: "macos / MP + poll + pthread (bctx)"
             os: macos-latest
-            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_SCHED_KQUEUE=OFF -DPTH_BUILD_PTHREAD=ON"
           - name: "macos / MP + kqueue + pthread (bctx)"
             os: macos-latest
             opts: "-DPTH_MP=ON -DPTH_SCHED_KQUEUE=ON -DPTH_BUILD_PTHREAD=ON"
@@ -70,11 +70,11 @@ jobs:
       matrix:
         include:
           - name: "freebsd / MP + poll + pthread"
-            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_BUILD_PTHREAD=ON"
+            opts: "-DPTH_MP=ON -DPTH_SCHED_POLL=ON -DPTH_SCHED_KQUEUE=OFF -DPTH_BUILD_PTHREAD=ON"
           - name: "freebsd / MP + kqueue + pthread"
             opts: "-DPTH_MP=ON -DPTH_SCHED_KQUEUE=ON -DPTH_BUILD_PTHREAD=ON"
           - name: "freebsd / single-scheduler"
-            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF"
+            opts: "-DPTH_MP=OFF -DPTH_SCHED_POLL=OFF -DPTH_SCHED_KQUEUE=OFF"
     steps:
       - uses: actions/checkout@v4
       - name: Build and test in FreeBSD VM

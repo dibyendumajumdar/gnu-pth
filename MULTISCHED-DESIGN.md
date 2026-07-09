@@ -1042,3 +1042,15 @@ and the full suite (including `test_epoll_scale`) is run on every push via the
 configurations. (Exception/out-of-band waits require `EVFILT_EXCEPT`, present on
 macOS and FreeBSD 11+; read/write readiness -- the overwhelmingly common case --
 needs only the universal `EVFILT_READ`/`EVFILT_WRITE`.)
+
+**Defaults (as of the kqueue landing).** Once both backends were green in CI, the
+scalable backend became the *platform default*: `PTH_SCHED_EPOLL` defaults ON on
+Linux and `PTH_SCHED_KQUEUE` defaults ON on \*BSD/macOS (CMake selects by
+`CMAKE_SYSTEM_NAME`). A build with no backend flags therefore gets the native
+persistent-registration poller; `-DPTH_SCHED_EPOLL=OFF` / `-DPTH_SCHED_KQUEUE=OFF`
+falls back to poll(2) (or select(2) with `PTH_SCHED_POLL=OFF` as well). The
+poll/select/single-scheduler CI configurations pin the fallback explicitly so
+they keep exercising those paths. This is still a build-time choice with no
+public API/ABI change; the fd-reuse contract above now applies by default on
+those platforms, which is why the reuse-immune poll/select paths are retained as
+first-class, explicitly selectable fallbacks.
