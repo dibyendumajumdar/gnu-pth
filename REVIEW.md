@@ -253,3 +253,128 @@ Rebuilt and ran under plain `PTH_MP`, `PTH_MP + PTH_SCHED_POLL` (the new
 defaults), the pthread emulation, and the default single-scheduler build. All MP
 tests pass, including the two new `test_once_mp` and `test_oncecancel_mp`; the
 latter was confirmed to hang against a build with the cleanup fix reverted.
+
+
+---
+
+## Third Follow-up Review: Open Findings
+
+Scope: updates after the second follow-up, especially `MULTISCHED-DESIGN.md`
+sections covering Boost.Context `bctx`, the persistent epoll/kqueue scheduler
+backends, and the new CMake backend defaults.
+
+### High: persistent fd backend can strand waiters after close-while-waiting
+
+The epoll backend keeps a userspace registration cache (`registered`,
+`regmask`) in `pth_sched.c`. If an application closes a descriptor while a
+thread is still waiting on it, Linux removes that descriptor from the epoll
+interest set, but the cache can still say it is registered. On the next event
+manager pass, if the same fd/mask is still wanted, `pth_evp_ctl()` does not call
+`epoll_ctl()` at all because `r->registered` is true and `r->regmask ==
+r->want`. The scheduler can then block in `epoll_wait()` with no kernel
+registration for the waiter, so the thread may never be woken.
+
+This is related to the fd-reuse limitation documented in `MULTISCHED-DESIGN.md`,
+but it is broader than same-tick fd reuse: plain close-while-waiting is enough
+to invalidate the kernel registration while leaving the userspace cache stale.
+The backend needs either a reliable eviction path (for example a `pth_close()`
+wrapper used by Pth-managed fds), a conservative validation/re-add strategy, or
+a clearly documented hard restriction that descriptors must not be closed while
+any Pth thread may still be waiting on them, with regression coverage.
+
+### Medium: evport bad-fd handling regresses `PTH_EVENT_SELECT` failure semantics
+
+The poll backend maps `POLLNVAL` to `PTH_STATUS_FAILED`, so a `pth_select()` wait
+on an invalid descriptor fails instead of becoming ready. The epoll/kqueue
+evport path does not carry a failure bit into the cleanup loop: `pth_evp_ready()`
+returns only readiness bits, and the cleanup for `PTH_EVENT_FD` /
+`PTH_EVENT_SELECT` only marks events occurred when those readiness bits match.
+
+In the epoll `ADD` failure path, bad descriptors are deliberately reported as
+ready so higher-level I/O wrappers can make the real syscall and return the real
+error. That is fine for `pth_read()` / `pth_write()` style waits, but it is wrong
+for `PTH_EVENT_SELECT`: there is no follow-up syscall that can report `EBADF`,
+so invalid descriptors can be reported as ready instead of failed. The evport
+backend should preserve an explicit failed state for bad fd registrations and
+map that to `PTH_STATUS_FAILED` for `PTH_EVENT_SELECT`, matching the select/poll
+backends.
+
+### Low: backend default documentation is internally stale
+
+`MULTISCHED-DESIGN.md` still titles the epoll section as "opt-in,
+`PTH_SCHED_EPOLL`", but the later defaults text and current CMake logic make
+epoll the default backend on Linux and kqueue the default backend on
+BSD/macOS. This is not a runtime issue, but it makes the design document
+internally inconsistent for reviewers and users trying to understand the
+default behavior.
+
+### Third Follow-up Verification Performed
+
+A fresh Linux CMake configure in `/tmp/gnu-pth-review-current` with
+`PTH_BUILD_TESTS=ON` and `PTH_BUILD_PTHREAD=ON` selected the new default epoll
+backend and built successfully. In that environment, the registered suite
+passed through the existing MP tests, `test_epoll_scale` passed, and
+`test_philo_mp` passed. My sandboxed run timed out in `test_netio_mp`; this was
+not treated as a confirmed finding and appears to be an artifact of the
+restricted execution sandbox, because a standalone run outside that sandbox
+completed successfully in 0.017s:
+
+```
+part1 socketpair streams: 4 pairs x 262144 bytes (write/send + read/select), OK
+part2 connect/accept (cross-scheduler): OK
+schedulers: 4
+ALL NETIO-MP TESTS PASSED
+```
+
+
+---
+
+## Fourth Follow-up Review: Boost.Context `bctx` Open Findings
+
+Scope: the new Boost.Context/fcontext machine-context method (`PTH_MCTX_MTH=bctx`),
+including CMake selection, vendored assembly integration, context-switch
+semantics, and MP compatibility.
+
+### Medium: `bctx` does not preserve `errno` across context switches
+
+The existing machine-context contract treats `errno` as part of the saved
+context: the `mcsc` and `sjlj` paths save `mctx->error = errno` before switching
+and restore `errno = mctx->error` when entering a context. The `bctx` path does
+not currently do the equivalent. `pth_mctx_switch_bctx()` swaps the signal mask
+and fcontext handle, but does not save the outgoing context's `errno` or restore
+the incoming context's saved value. `pth_mctx_restore_bctx()` likewise jumps
+into the target context without restoring `mctx->error`.
+
+This can leak `errno` between Pth threads or standalone `pth_uctx` contexts,
+especially after scheduler activity or a non-returning `pth_uctx` restore. The
+fix should mirror the other methods: save `old->error = errno` before
+`jump_fcontext()`, restore the resumed context's saved `errno` when control
+returns, and set `errno = mctx->error` in the non-returning restore path before
+jumping.
+
+### Low: CMake cache help does not list `bctx` as a supported mctx method
+
+`PTH_MCTX_MTH` is now selectable as `bctx` and is the default on macOS when
+vendored fcontext assembly is available, but the CMake cache help still
+describes the option as only `mcsc, sjlj`. This is a documentation/discovery
+issue rather than a runtime defect, but it makes the new supported path harder
+to find and can mislead users trying to force the context method.
+
+### Fourth Follow-up Verification Performed
+
+A forced Linux `bctx` build was configured with:
+
+```
+cmake -S . -B /tmp/gnu-pth-review-bctx \
+  -DPTH_MCTX_MTH=bctx \
+  -DPTH_BUILD_TESTS=ON \
+  -DPTH_BUILD_PTHREAD=ON \
+  -DPTH_SCHED_EPOLL=OFF \
+  -DPTH_SCHED_POLL=ON
+```
+
+The build succeeded, including both `libpth` and the pthread emulation, and
+selected the vendored x86_64 ELF fcontext assembly. The registered test set
+excluding the sandbox-sensitive `test_netio_mp` passed: 17/17 tests, including
+the MP scheduler, join, message-port, cancel/raise, suspend, once, epoll-scale,
+pthread-emulation, and bounded philosopher tests.
