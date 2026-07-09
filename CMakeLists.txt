@@ -530,6 +530,10 @@ if(PTH_BUILD_TESTS)
             add_test(NAME ${t} COMMAND ${t})
             set_tests_properties(${t} PROPERTIES TIMEOUT 120)
         endforeach()
+        # bounded multi-scheduler run of the dining-philosophers demo
+        # (test_philo itself is built above; here we register its "mp" mode)
+        add_test(NAME test_philo_mp COMMAND test_philo mp)
+        set_tests_properties(test_philo_mp PROPERTIES TIMEOUT 120)
     endif()
 endif()
 

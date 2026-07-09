@@ -30,6 +30,13 @@
  *  Reference: E.W. Dijkstra,
  *             ``Hierarchical Ordering of Sequential Processes'',
  *             Acta Informatica 1, 1971, 115-138.
+ *
+ *  Run with no argument for the classic interactive demonstration (single
+ *  scheduler). Run as `test_philo mp' for a bounded multi-scheduler test: 3
+ *  scheduler OS threads with the 5 philosophers spread across them, so the
+ *  shared fork mutex and the per-philosopher condition variables are exercised
+ *  across schedulers. It checks that every philosopher makes progress (no
+ *  deadlock, no starvation) and then cancels/joins them across schedulers.
  */
 
 #include <stdio.h>
@@ -43,6 +50,7 @@
 #include "test_common.h"
 
 #define PHILNUM 5
+#define MP_SCHEDS 3
 
 typedef enum {
     thinking,
@@ -62,9 +70,12 @@ typedef struct tablestruct {
     pth_mutex_t mutex;
     pth_cond_t  condition[PHILNUM];
     philstat    status[PHILNUM];
+    long        eaten[PHILNUM];   /* meals per philosopher (MP-mode liveness) */
+    int         sched[PHILNUM];   /* scheduler each philosopher runs on       */
 } table;
 
 static table *tab;
+static int    g_mp = 0;          /* multi-scheduler mode */
 
 static void printstate(void)
 {
@@ -74,6 +85,22 @@ static void printstate(void)
         printf("| %s ", philstatstr[(int)(tab->status)[i]]);
     printf("|\n");
     return;
+}
+
+static void think(unsigned int who)
+{
+    if (g_mp)
+        pth_nap(pth_time(0, (who + 1) * 5000));   /* (who+1)*5ms */
+    else
+        pth_sleep(who + 1);
+}
+static void eat(unsigned int who)
+{
+    if (g_mp)
+        pth_nap(pth_time(0, 5000));               /* 5ms */
+    else
+        pth_sleep(1);
+    (void)who;
 }
 
 static int test(unsigned int i)
@@ -92,10 +119,11 @@ static void pickup(unsigned int k)
 {
     pth_mutex_acquire(&(tab->mutex), FALSE, NULL);
     (tab->status)[k] = hungry;
-    printstate();
+    if (!g_mp) printstate();
     if (!test(k))
         pth_cond_await(&((tab->condition)[k]), &(tab->mutex), NULL);
-    printstate();
+    (tab->eaten)[k]++;            /* we are now eating (protected by mutex) */
+    if (!g_mp) printstate();
     pth_mutex_release(&(tab->mutex));
     return;
 }
@@ -104,7 +132,7 @@ static void putdown(unsigned int k)
 {
     pth_mutex_acquire(&(tab->mutex), FALSE, NULL);
     (tab->status)[k] = thinking;
-    printstate();
+    if (!g_mp) printstate();
     test((k + 1) % PHILNUM);
     test((k - 1 + PHILNUM) % PHILNUM);
     pth_mutex_release(&(tab->mutex));
@@ -115,16 +143,75 @@ static void *philosopher(void *_who)
 {
     unsigned int *who = (unsigned int *)_who;
 
+    if (g_mp)
+        (tab->sched)[*who] = pth_sched_id();   /* which scheduler runs us */
+
     /* For simplicity, all philosophers eat for the same amount of time
        and think for a time that is simply related to their position at
        the table. The parameter who identifies the philosopher: 0,1,2,.. */
     for (;;) {
-        pth_sleep((*who) + 1);
+        think(*who);
         pickup((*who));
-        pth_sleep(1);
+        eat(*who);
         putdown((*who));
     }
     return NULL;
+}
+
+/* ---- bounded multi-scheduler test -------------------------------------- */
+static int run_mp(void)
+{
+    int i, ns, fails = 0;
+    pth_attr_t attr;
+
+    if (!pth_mp_init(MP_SCHEDS)) {
+        fprintf(stderr, "pth_mp_init(%d) failed (library built without PTH_MP?)\n", MP_SCHEDS);
+        return 1;
+    }
+    ns = pth_sched_count();
+    printf("TEST_PHILO (multi-scheduler): %d philosophers over %d schedulers\n",
+           PHILNUM, ns);
+
+    tab = (table *)malloc(sizeof(table));
+    memset(tab, 0, sizeof(*tab));
+    pth_mutex_init(&(tab->mutex));
+    for (i = 0; i < PHILNUM; i++) {
+        (tab->self)[i]   = i;
+        (tab->status)[i] = thinking;
+        pth_cond_init(&((tab->condition)[i]));
+    }
+
+    /* spread the philosophers across the schedulers; joinable so we can
+       reap them by tid across schedulers afterwards */
+    attr = pth_attr_new();
+    pth_attr_set(attr, PTH_ATTR_JOINABLE, TRUE);
+    for (i = 0; i < PHILNUM; i++) {
+        (tab->tid)[i] = pth_spawn_on(i % ns, attr, philosopher, &((tab->self)[i]));
+        if ((tab->tid)[i] == NULL) { perror("pth_spawn_on"); return 1; }
+    }
+    pth_attr_destroy(attr);
+
+    /* let them dine for a bounded while */
+    pth_nap(pth_time(3, 0));
+
+    /* cross-scheduler cancel + join of every philosopher */
+    for (i = 0; i < PHILNUM; i++)
+        pth_cancel((tab->tid)[i]);
+    for (i = 0; i < PHILNUM; i++)
+        pth_join((tab->tid)[i], NULL);
+
+    pth_mp_shutdown();
+
+    /* report + verdict: everyone must have eaten (liveness / no deadlock) */
+    for (i = 0; i < PHILNUM; i++) {
+        printf("philosopher %d: sched %d, ate %ld times %s\n",
+               i, (tab->sched)[i], (tab->eaten)[i],
+               (tab->eaten)[i] > 0 ? "OK" : "FAIL (starved/deadlocked)");
+        if ((tab->eaten)[i] <= 0) fails++;
+    }
+    free(tab);
+    printf(fails == 0 ? "ALL PHILO-MP TESTS PASSED\n" : "%d PHILO-MP TESTS FAILED\n", fails);
+    return fails == 0 ? 0 : 1;
 }
 
 int main(int argc, char *argv[])
@@ -136,6 +223,14 @@ int main(int argc, char *argv[])
 
     /* initialize Pth library */
     pth_init();
+
+    if (argc > 1 && strcmp(argv[1], "mp") == 0) {
+        int rc;
+        g_mp = 1;
+        rc = run_mp();
+        pth_kill();
+        return rc;
+    }
 
     /* display test program header */
     printf("This is TEST_PHILO, a Pth test showing the Five Dining Philosophers\n");
@@ -159,12 +254,15 @@ int main(int argc, char *argv[])
     printf("deadlock (all philosophers wait that the chopstick to their left becomes\n");
     printf("available).\n");
     printf("\n");
+    printf("(Hint: run `test_philo mp' for a bounded multi-scheduler variant.)\n");
+    printf("\n");
     printf("The demonstration runs max. 60 seconds. To stop before, press CTRL-C.\n");
     printf("\n");
     printf("+----P1----+----P2----+----P3----+----P4----+----P5----+\n");
 
     /* initialize the control table */
     tab = (table *)malloc(sizeof(table));
+    memset(tab, 0, sizeof(*tab));
     if (!pth_mutex_init(&(tab->mutex))) {
         perror("pth_mutex_init");
         exit(1);
@@ -211,4 +309,3 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-
