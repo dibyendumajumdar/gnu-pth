@@ -110,6 +110,20 @@ struct pth_gsched_st {
     unsigned long osthread;    /* pthread_t of the scheduler's OS thread */
     pth_atomic_t boot_done;    /* bootstrap finished flag                */
     int          boot_rc;      /* bootstrap result                       */
+#ifdef PTH_SCHED_EPOLL
+    int          evp_fd;        /* epoll(7) instance for this scheduler   */
+    struct pth_evreg_st *evp_reg;/* fd-indexed registration cache         */
+    int          evp_regcap;    /* slots allocated in evp_reg             */
+    unsigned int evp_gen;       /* current event-manager pass generation  */
+    int         *evp_touched;   /* fds wanted this pass                    */
+    int          evp_ntouched;
+    int          evp_touchedcap;
+    int         *evp_reglist;   /* fds currently in the kernel interest set*/
+    int          evp_nreg;
+    int          evp_reglistcap;
+    void        *evp_evs;       /* epoll_wait() result buffer             */
+    int          evp_evcap;
+#endif
 };
 
 #define PTH_GSCHED_MAX 64      /* maximum number of schedulers */
@@ -184,6 +198,10 @@ intern int pth_scheduler_init(void)
         return pth_error(FALSE, errno);
     if (pth_fdmode(g->sigpipe[1], PTH_FDMODE_NONBLOCK) == PTH_FDMODE_ERROR)
         return pth_error(FALSE, errno);
+#ifdef PTH_SCHED_EPOLL
+    if (!pth_evp_init(g))
+        return pth_error(FALSE, errno);
+#endif
 
     /* initialize the essential threads */
     g->sched   = NULL;
@@ -255,6 +273,9 @@ intern void pth_scheduler_kill(void)
     pth_scheduler_drop();
 
     /* remove the internal signal pipe */
+#ifdef PTH_SCHED_EPOLL
+    pth_evp_kill(g);
+#endif
     close(g->sigpipe[0]);
     close(g->sigpipe[1]);
     return;
@@ -1214,11 +1235,661 @@ intern void pth_sched_eventmanager_poll(pth_time_t *now, int dopoll)
 
 #endif /* PTH_SCHED_POLL */
 
+#ifdef PTH_SCHED_EPOLL
+/*
+ * epoll(7)-based fd readiness for the scheduler core (opt-in via
+ * -DPTH_SCHED_EPOLL, which also switches on the poll(2) fast paths).  Where
+ * select(2)/poll(2) rebuild and rescan the whole descriptor set on every
+ * scheduler pass, epoll keeps a *persistent* interest set in the kernel: a
+ * scheduler with N idle waiters no longer costs an N-descriptor kernel scan
+ * each pass -- epoll_wait() returns only the ready descriptors.  Each
+ * scheduler owns its own epoll instance plus an fd-indexed registration
+ * cache; the cache is diffed against the waiting queue each pass so only
+ * genuine changes reach epoll_ctl().  See MULTISCHED-DESIGN.md section 23.
+ */
+#include <sys/epoll.h>
+#include <fcntl.h>
+
+#define PTH_EVP_R 0x1
+#define PTH_EVP_W 0x2
+#define PTH_EVP_E 0x4
+
+struct pth_evreg_st {
+    unsigned int  gen;        /* pass this fd was last wanted in            */
+    unsigned int  rdygen;     /* pass this fd's readiness was last set in   */
+    short         want;       /* PTH_EVP_* mask wanted this pass            */
+    short         regmask;    /* PTH_EVP_* mask currently in the kernel     */
+    short         ready;      /* PTH_EVP_* readiness from this pass         */
+    unsigned char registered; /* currently in the kernel interest set       */
+};
+
+static int pth_evp_to_epoll(short m)
+{
+    int e = 0;
+    if (m & PTH_EVP_R) e |= EPOLLIN;
+    if (m & PTH_EVP_W) e |= EPOLLOUT;
+    if (m & PTH_EVP_E) e |= EPOLLPRI;
+    return e;
+}
+
+static short pth_evp_from_epoll(int e)
+{
+    short m = 0;
+    if (e & (EPOLLIN |EPOLLHUP|EPOLLERR)) m |= PTH_EVP_R;
+    if (e & (EPOLLOUT|EPOLLHUP|EPOLLERR)) m |= PTH_EVP_W;
+    if (e & EPOLLPRI)                     m |= PTH_EVP_E;
+    return m;
+}
+
+static int pth_evp_grow_reg(pth_gsched_t *g, int fd)
+{
+    int nc, i;
+    struct pth_evreg_st *nr;
+    if (fd < g->evp_regcap)
+        return TRUE;
+    nc = (g->evp_regcap == 0 ? 64 : g->evp_regcap);
+    while (nc <= fd)
+        nc *= 2;
+    nr = (struct pth_evreg_st *)realloc(g->evp_reg, nc * sizeof(struct pth_evreg_st));
+    if (nr == NULL)
+        return FALSE;
+    for (i = g->evp_regcap; i < nc; i++) {
+        nr[i].gen = 0; nr[i].rdygen = 0;
+        nr[i].want = 0; nr[i].regmask = 0;
+        nr[i].ready = 0; nr[i].registered = 0;
+    }
+    g->evp_reg = nr;
+    g->evp_regcap = nc;
+    return TRUE;
+}
+
+static int pth_evp_push(int **v, int *n, int *cap, int fd)
+{
+    if (*n >= *cap) {
+        int nc = (*cap == 0 ? 32 : *cap * 2);
+        int *nv = (int *)realloc(*v, nc * sizeof(int));
+        if (nv == NULL)
+            return FALSE;
+        *v = nv; *cap = nc;
+    }
+    (*v)[(*n)++] = fd;
+    return TRUE;
+}
+
+static void pth_evp_begin(pth_gsched_t *g)
+{
+    g->evp_gen++;
+    g->evp_ntouched = 0;
+    if (g->evp_gen == 0) {           /* generation wrapped: invalidate cache */
+        int i;
+        for (i = 0; i < g->evp_regcap; i++) {
+            g->evp_reg[i].gen = 0;
+            g->evp_reg[i].rdygen = 0;
+        }
+        g->evp_gen = 1;
+    }
+}
+
+static int pth_evp_want(pth_gsched_t *g, int fd, short mask)
+{
+    struct pth_evreg_st *r;
+    if (fd < 0)
+        return FALSE;
+    if (!pth_evp_grow_reg(g, fd))
+        return FALSE;
+    r = &g->evp_reg[fd];
+    if (r->gen != g->evp_gen) {       /* first time this fd is wanted this pass */
+        r->gen  = g->evp_gen;
+        r->want = mask;
+        return pth_evp_push(&g->evp_touched, &g->evp_ntouched, &g->evp_touchedcap, fd);
+    }
+    r->want |= mask;
+    return TRUE;
+}
+
+static void pth_evp_ctl(pth_gsched_t *g, int fd, struct pth_evreg_st *r)
+{
+    struct epoll_event ee;
+    memset(&ee, 0, sizeof(ee));
+    ee.events  = pth_evp_to_epoll(r->want);
+    ee.data.fd = fd;
+    if (!r->registered) {
+        if (epoll_ctl(g->evp_fd, EPOLL_CTL_ADD, fd, &ee) == 0) {
+            r->registered = 1;
+            r->regmask = r->want;
+            pth_evp_push(&g->evp_reglist, &g->evp_nreg, &g->evp_reglistcap, fd);
+        }
+        else if (errno == EEXIST) {
+            /* kernel still holds a stale registration we lost track of */
+            if (epoll_ctl(g->evp_fd, EPOLL_CTL_MOD, fd, &ee) == 0) {
+                r->registered = 1;
+                r->regmask = r->want;
+                pth_evp_push(&g->evp_reglist, &g->evp_nreg, &g->evp_reglistcap, fd);
+            }
+        }
+        else {
+            /* bad descriptor etc.: report ready so the waiter's own I/O call
+               returns the real error instead of blocking forever */
+            r->ready  = r->want;
+            r->rdygen = g->evp_gen;
+        }
+    }
+    else if (r->regmask != r->want) {
+        if (epoll_ctl(g->evp_fd, EPOLL_CTL_MOD, fd, &ee) == 0)
+            r->regmask = r->want;
+        else if (errno == ENOENT) {
+            /* descriptor was closed under us and the number reused: the kernel
+               dropped the old registration, so add the new one afresh */
+            if (epoll_ctl(g->evp_fd, EPOLL_CTL_ADD, fd, &ee) == 0)
+                r->regmask = r->want;
+        }
+    }
+}
+
+static void pth_evp_commit(pth_gsched_t *g)
+{
+    int i;
+    /* ADD/MOD everything wanted this pass */
+    for (i = 0; i < g->evp_ntouched; i++) {
+        int fd = g->evp_touched[i];
+        pth_evp_ctl(g, fd, &g->evp_reg[fd]);
+    }
+    /* DEL everything still registered but no longer wanted (swap-remove) */
+    for (i = 0; i < g->evp_nreg; ) {
+        int fd = g->evp_reglist[i];
+        struct pth_evreg_st *r = &g->evp_reg[fd];
+        if (r->gen != g->evp_gen) {
+            epoll_ctl(g->evp_fd, EPOLL_CTL_DEL, fd, NULL);
+            r->registered = 0;
+            r->regmask = 0;
+            g->evp_reglist[i] = g->evp_reglist[--g->evp_nreg];
+        }
+        else
+            i++;
+    }
+}
+
+static int pth_evp_wait(pth_gsched_t *g, int timeout_ms)
+{
+    struct epoll_event *evs;
+    int n, i;
+    if (g->evp_nreg + 1 > g->evp_evcap) {
+        int nc = (g->evp_evcap == 0 ? 64 : g->evp_evcap);
+        struct epoll_event *ne;
+        while (nc < g->evp_nreg + 1)
+            nc *= 2;
+        ne = (struct epoll_event *)realloc(g->evp_evs, nc * sizeof(struct epoll_event));
+        if (ne != NULL) { g->evp_evs = ne; g->evp_evcap = nc; }
+    }
+    if (g->evp_evcap == 0)
+        return 0;
+    while ((n = epoll_wait(g->evp_fd, (struct epoll_event *)g->evp_evs,
+                           g->evp_evcap, timeout_ms)) < 0 && errno == EINTR) ;
+    if (n > 0) {
+        evs = (struct epoll_event *)g->evp_evs;
+        for (i = 0; i < n; i++) {
+            int fd = evs[i].data.fd;
+            if (fd >= 0 && fd < g->evp_regcap) {
+                g->evp_reg[fd].ready  = pth_evp_from_epoll(evs[i].events);
+                g->evp_reg[fd].rdygen = g->evp_gen;
+            }
+        }
+    }
+    return n;
+}
+
+static short pth_evp_ready(pth_gsched_t *g, int fd)
+{
+    if (fd >= 0 && fd < g->evp_regcap && g->evp_reg[fd].rdygen == g->evp_gen)
+        return g->evp_reg[fd].ready;
+    return 0;
+}
+
+intern int pth_evp_init(pth_gsched_t *g)
+{
+    g->evp_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (g->evp_fd < 0) {
+        /* older kernels without epoll_create1(2) */
+        g->evp_fd = epoll_create(256);
+        if (g->evp_fd < 0)
+            return FALSE;
+        fcntl(g->evp_fd, F_SETFD, FD_CLOEXEC);
+    }
+    g->evp_reg = NULL;     g->evp_regcap = 0;      g->evp_gen = 0;
+    g->evp_touched = NULL; g->evp_ntouched = 0;    g->evp_touchedcap = 0;
+    g->evp_reglist = NULL; g->evp_nreg = 0;        g->evp_reglistcap = 0;
+    g->evp_evs = NULL;     g->evp_evcap = 0;
+    return TRUE;
+}
+
+intern void pth_evp_kill(pth_gsched_t *g)
+{
+    if (g->evp_fd >= 0)
+        close(g->evp_fd);
+    g->evp_fd = -1;
+    if (g->evp_reg     != NULL) { free(g->evp_reg);     g->evp_reg = NULL; }
+    if (g->evp_touched != NULL) { free(g->evp_touched); g->evp_touched = NULL; }
+    if (g->evp_reglist != NULL) { free(g->evp_reglist); g->evp_reglist = NULL; }
+    if (g->evp_evs     != NULL) { free(g->evp_evs);     g->evp_evs = NULL; }
+    g->evp_regcap = g->evp_touchedcap = g->evp_reglistcap = g->evp_evcap = 0;
+    g->evp_ntouched = g->evp_nreg = 0;
+}
+
+intern void pth_sched_eventmanager_evport(pth_time_t *now, int dopoll)
+{
+    pth_gsched_t *g = pth_gsched_active;
+    pth_t nexttimer_thread;
+    pth_event_t nexttimer_ev;
+    pth_time_t nexttimer_value;
+    pth_event_t evh;
+    pth_event_t ev;
+    pth_t t;
+    pth_t tlast;
+    int this_occurred;
+    int any_occurred;
+    struct timeval delay;
+    struct timeval *pdelay;
+    sigset_t oss;
+    struct sigaction sa;
+    struct sigaction osa[1+PTH_NSIG];
+    char minibuf[128];
+    int loop_repeat;
+    int rc;
+    int sig;
+    int n;
+
+    pth_debug2("pth_sched_eventmanager: enter in %s mode",
+               dopoll ? "polling" : "waiting");
+
+    /* entry point for internal looping in event handling */
+    loop_entry:
+    loop_repeat = FALSE;
+    pth_evp_begin(g);
+
+    /* clear the signal pipe and drain the wakeup inbox first: an already
+       delivered wakeup must prevent us from blocking in select(2) below
+       (producers push their message before writing the pipe byte) */
+    while (pth_sc(read)(g->sigpipe[0], minibuf, sizeof(minibuf)) > 0) ;
+    if (pth_gsched_drain(g))
+        dopoll = TRUE;
+
+
+    /* initialize signal status */
+    sigpending(&g->sigpending);
+    sigfillset(&g->sigblock);
+    sigemptyset(&g->sigcatch);
+    sigemptyset(&g->sigraised);
+
+    /* initialize next timer */
+    pth_time_set(&nexttimer_value, PTH_TIME_ZERO);
+    nexttimer_thread = NULL;
+    nexttimer_ev = NULL;
+
+    /* for all threads in the waiting queue... */
+    any_occurred = FALSE;
+    for (t = pth_pqueue_head(&g->WQ); t != NULL;
+         t = pth_pqueue_walk(&g->WQ, t, PTH_WALK_NEXT)) {
+
+        /* determine signals we block */
+        for (sig = 1; sig < PTH_NSIG; sig++)
+            if (!sigismember(&(t->mctx.sigs), sig))
+                sigdelset(&g->sigblock, sig);
+
+        /* cancellation support */
+        if (t->cancelreq == TRUE)
+            any_occurred = TRUE;
+
+        /* ... and all their events... */
+        if (t->events == NULL)
+            continue;
+        /* ...check whether events occurred */
+        ev = evh = t->events;
+        do {
+            if (ev->ev_status == PTH_STATUS_PENDING) {
+                this_occurred = FALSE;
+
+                /* Filedescriptor I/O */
+                if (ev->ev_type == PTH_EVENT_FD) {
+                    /* filedescriptors are checked later all at once.
+                       Here we only assemble them in the fd sets */
+                    short pe = 0;
+                    if (ev->ev_goal & PTH_UNTIL_FD_READABLE)  pe |= PTH_EVP_R;
+                    if (ev->ev_goal & PTH_UNTIL_FD_WRITEABLE) pe |= PTH_EVP_W;
+                    if (ev->ev_goal & PTH_UNTIL_FD_EXCEPTION) pe |= PTH_EVP_E;
+                    pth_evp_want(g, ev->ev_args.FD.fd, pe);
+                }
+                /* Filedescriptor Set Select I/O */
+                else if (ev->ev_type == PTH_EVENT_SELECT) {
+                    /* filedescriptors are checked later all at once.
+                       Here we only merge the fd sets. */
+                    int sfd;
+                    for (sfd = 0; sfd < ev->ev_args.SELECT.nfd; sfd++) {
+                        short pe = 0;
+                        if (ev->ev_args.SELECT.rfds && FD_ISSET(sfd, ev->ev_args.SELECT.rfds)) pe |= PTH_EVP_R;
+                        if (ev->ev_args.SELECT.wfds && FD_ISSET(sfd, ev->ev_args.SELECT.wfds)) pe |= PTH_EVP_W;
+                        if (ev->ev_args.SELECT.efds && FD_ISSET(sfd, ev->ev_args.SELECT.efds)) pe |= PTH_EVP_E;
+                        if (pe != 0)
+                            pth_evp_want(g, sfd, pe);
+                    }
+                }
+                /* Signal Set */
+                else if (ev->ev_type == PTH_EVENT_SIGS) {
+                    for (sig = 1; sig < PTH_NSIG; sig++) {
+                        if (sigismember(ev->ev_args.SIGS.sigs, sig)) {
+                            /* thread signal handling */
+                            if (sigismember(&t->sigpending, sig)) {
+                                *(ev->ev_args.SIGS.sig) = sig;
+                                sigdelset(&t->sigpending, sig);
+                                t->sigpendcnt--;
+                                this_occurred = TRUE;
+                            }
+                            /* process signal handling */
+                            if (sigismember(&g->sigpending, sig)) {
+                                if (ev->ev_args.SIGS.sig != NULL)
+                                    *(ev->ev_args.SIGS.sig) = sig;
+                                pth_util_sigdelete(sig);
+                                sigdelset(&g->sigpending, sig);
+                                this_occurred = TRUE;
+                            }
+                            else {
+                                sigdelset(&g->sigblock, sig);
+                                sigaddset(&g->sigcatch, sig);
+                            }
+                        }
+                    }
+                }
+                /* Timer */
+                else if (ev->ev_type == PTH_EVENT_TIME) {
+                    if (pth_time_cmp(&(ev->ev_args.TIME.tv), now) < 0)
+                        this_occurred = TRUE;
+                    else {
+                        /* remember the timer which will be elapsed next */
+                        if ((nexttimer_thread == NULL && nexttimer_ev == NULL) ||
+                            pth_time_cmp(&(ev->ev_args.TIME.tv), &nexttimer_value) < 0) {
+                            nexttimer_thread = t;
+                            nexttimer_ev = ev;
+                            pth_time_set(&nexttimer_value, &(ev->ev_args.TIME.tv));
+                        }
+                    }
+                }
+                /* Message Port Arrivals */
+                else if (ev->ev_type == PTH_EVENT_MSG) {
+                    /* mp_queue is shared with cross-scheduler pth_msgport_put;
+                       read the predicate under the port's spinlock */
+                    pth_spin_lock(&ev->ev_args.MSG.mp->mp_lock);
+                    if (pth_ring_elements(&(ev->ev_args.MSG.mp->mp_queue)) > 0)
+                        this_occurred = TRUE;
+                    pth_spin_unlock(&ev->ev_args.MSG.mp->mp_lock);
+                }
+                /* Mutex Release and Condition Variable Signal events
+                   are not polled anymore: threads park on the
+                   primitive's wait queue and are woken explicitly
+                   through the scheduler's wakeup inbox (pth_sync.c) */
+                /* Thread Termination */
+                else if (ev->ev_type == PTH_EVENT_TID) {
+                    if (   (   ev->ev_args.TID.tid == NULL
+                            && pth_pqueue_elements(&g->DQ) > 0)
+                        || (   ev->ev_args.TID.tid != NULL
+                            && ev->ev_args.TID.tid->state == ev->ev_goal))
+                        this_occurred = TRUE;
+                }
+                /* Custom Event Function */
+                else if (ev->ev_type == PTH_EVENT_FUNC) {
+                    if (ev->ev_args.FUNC.func(ev->ev_args.FUNC.arg))
+                        this_occurred = TRUE;
+                    else {
+                        pth_time_t tv;
+                        pth_time_set(&tv, now);
+                        pth_time_add(&tv, &(ev->ev_args.FUNC.tv));
+                        if ((nexttimer_thread == NULL && nexttimer_ev == NULL) ||
+                            pth_time_cmp(&tv, &nexttimer_value) < 0) {
+                            nexttimer_thread = t;
+                            nexttimer_ev = ev;
+                            pth_time_set(&nexttimer_value, &tv);
+                        }
+                    }
+                }
+
+                /* tag event if it has occurred */
+                if (this_occurred) {
+                    pth_debug2("pth_sched_eventmanager: [non-I/O] event occurred for thread \"%s\"", t->name);
+                    ev->ev_status = PTH_STATUS_OCCURRED;
+                    any_occurred = TRUE;
+                }
+            }
+        } while ((ev = ev->ev_next) != evh);
+    }
+    if (any_occurred)
+        dopoll = TRUE;
+
+    /* now decide how to poll for fd I/O and timers */
+    if (dopoll) {
+        /* do a polling with immediate timeout,
+           i.e. check the fd sets only without blocking */
+        pth_time_set(&delay, PTH_TIME_ZERO);
+        pdelay = &delay;
+    }
+    else if (nexttimer_ev != NULL) {
+        /* do a polling with a timeout set to the next timer,
+           i.e. wait for the fd sets or the next timer */
+        pth_time_set(&delay, &nexttimer_value);
+        pth_time_sub(&delay, now);
+        pdelay = &delay;
+    }
+    else {
+        /* do a polling without a timeout,
+           i.e. wait for the fd sets only with blocking */
+        pdelay = NULL;
+    }
+
+    /* let poll() wait for the read-part of the signal pipe
+       (it was already cleared at the top of this event loop) */
+    pth_evp_want(g, g->sigpipe[0], PTH_EVP_R);
+    pth_evp_commit(g);
+
+    /* replace signal actions for signals we've to catch for events
+       (signal handling is the business of scheduler 0 only; auxiliary
+       schedulers keep all signals permanently blocked) */
+    if (g->id == 0) {
+        for (sig = 1; sig < PTH_NSIG; sig++) {
+            if (sigismember(&g->sigcatch, sig)) {
+                sa.sa_handler = pth_sched_eventmanager_sighandler;
+                sigfillset(&sa.sa_mask);
+                sa.sa_flags = 0;
+                sigaction(sig, &sa, &osa[sig]);
+            }
+        }
+
+        /* allow some signals to be delivered: Either to our
+           catching handler or directly to the configured
+           handler for signals not catched by events */
+        pth_sc(sigprocmask)(SIG_SETMASK, &g->sigblock, &oss);
+    }
+
+    /* now do the polling for filedescriptor I/O and timers
+       WHEN THE SCHEDULER SLEEPS AT ALL, THEN HERE!! */
+    rc = -1;
+    {
+        int ptimeout;
+        if (dopoll)
+            ptimeout = 0;
+        else if (pdelay != NULL) {
+            ptimeout = (int)(pdelay->tv_sec*1000 + (pdelay->tv_usec+999)/1000);
+            if (ptimeout < 0)
+                ptimeout = 0;
+        }
+        else
+            ptimeout = -1;   /* block indefinitely */
+        rc = pth_evp_wait(g, ptimeout);
+    }
+
+    /* restore signal mask and actions and handle signals */
+    if (g->id == 0) {
+        pth_sc(sigprocmask)(SIG_SETMASK, &oss, NULL);
+        for (sig = 1; sig < PTH_NSIG; sig++)
+            if (sigismember(&g->sigcatch, sig))
+                sigaction(sig, &osa[sig], NULL);
+    }
+
+    /* drain the wakeup inbox again: messages which arrived while we
+       were sleeping in select(2) must be applied before the cleanup
+       loop below moves threads out of the waiting queue */
+    pth_gsched_drain(g);
+
+    /* if the timer elapsed, handle it */
+    if (!dopoll && rc == 0 && nexttimer_ev != NULL) {
+        if (nexttimer_ev->ev_type == PTH_EVENT_FUNC) {
+            /* it was an implicit timer event for a function event,
+               so repeat the event handling for rechecking the function */
+            loop_repeat = TRUE;
+        }
+        else {
+            /* it was an explicit timer event, standing for its own */
+            pth_debug2("pth_sched_eventmanager: [timeout] event occurred for thread \"%s\"",
+                       nexttimer_thread->name);
+            nexttimer_ev->ev_status = PTH_STATUS_OCCURRED;
+        }
+    }
+
+    /* if the internal signal pipe was used, adjust the poll() results */
+    if (!dopoll && rc > 0 && (pth_evp_ready(g, g->sigpipe[0]) & PTH_EVP_R))
+        rc--;
+
+    /* on timeout/error nothing is ready (fd readiness is generation-stamped) */
+
+    /* now comes the final cleanup loop where we've to
+       do two jobs: first we've to do the late handling of the fd I/O events and
+       additionally if a thread has one occurred event, we move it from the
+       waiting queue to the ready queue */
+
+    /* for all threads in the waiting queue... */
+    t = pth_pqueue_head(&g->WQ);
+    while (t != NULL) {
+
+        /* do the late handling of the fd I/O and signal
+           events in the waiting event ring */
+        any_occurred = FALSE;
+        if (t->events != NULL) {
+            ev = evh = t->events;
+            do {
+                /*
+                 * Late handling for still not occured events
+                 */
+                if (ev->ev_status == PTH_STATUS_PENDING) {
+                    /* Filedescriptor I/O */
+                    if (ev->ev_type == PTH_EVENT_FD) {
+                        short re = pth_evp_ready(g, ev->ev_args.FD.fd);
+                        if (   ((ev->ev_goal & PTH_UNTIL_FD_READABLE)  && (re & PTH_EVP_R))
+                            || ((ev->ev_goal & PTH_UNTIL_FD_WRITEABLE) && (re & PTH_EVP_W))
+                            || ((ev->ev_goal & PTH_UNTIL_FD_EXCEPTION) && (re & PTH_EVP_E)) ) {
+                            pth_debug2("pth_sched_eventmanager: "
+                                       "[I/O] event occurred for thread \"%s\"", t->name);
+                            ev->ev_status = PTH_STATUS_OCCURRED;
+                        }
+                    }
+                    /* Filedescriptor Set I/O */
+                    else if (ev->ev_type == PTH_EVENT_SELECT) {
+                        fd_set trfds, twfds, tefds;
+                        int sfd;
+                        FD_ZERO(&trfds); FD_ZERO(&twfds); FD_ZERO(&tefds);
+                        for (sfd = 0; sfd < ev->ev_args.SELECT.nfd; sfd++) {
+                            short re = pth_evp_ready(g, sfd);
+                            if (re == 0)
+                                continue;
+                            if ((re & PTH_EVP_R) && ev->ev_args.SELECT.rfds
+                                && FD_ISSET(sfd, ev->ev_args.SELECT.rfds))  FD_SET(sfd, &trfds);
+                            if ((re & PTH_EVP_W) && ev->ev_args.SELECT.wfds
+                                && FD_ISSET(sfd, ev->ev_args.SELECT.wfds))  FD_SET(sfd, &twfds);
+                            if ((re & PTH_EVP_E) && ev->ev_args.SELECT.efds
+                                && FD_ISSET(sfd, ev->ev_args.SELECT.efds))  FD_SET(sfd, &tefds);
+                        }
+                        if (pth_util_fds_test(ev->ev_args.SELECT.nfd,
+                                              ev->ev_args.SELECT.rfds, &trfds,
+                                              ev->ev_args.SELECT.wfds, &twfds,
+                                              ev->ev_args.SELECT.efds, &tefds)) {
+                            n = pth_util_fds_select(ev->ev_args.SELECT.nfd,
+                                                    ev->ev_args.SELECT.rfds, &trfds,
+                                                    ev->ev_args.SELECT.wfds, &twfds,
+                                                    ev->ev_args.SELECT.efds, &tefds);
+                            if (ev->ev_args.SELECT.n != NULL)
+                                *(ev->ev_args.SELECT.n) = n;
+                            ev->ev_status = PTH_STATUS_OCCURRED;
+                            pth_debug2("pth_sched_eventmanager: "
+                                       "[I/O] event occurred for thread \"%s\"", t->name);
+                        }
+                    }
+                    /* Signal Set */
+                    else if (ev->ev_type == PTH_EVENT_SIGS) {
+                        for (sig = 1; sig < PTH_NSIG; sig++) {
+                            if (sigismember(ev->ev_args.SIGS.sigs, sig)) {
+                                if (sigismember(&g->sigraised, sig)) {
+                                    if (ev->ev_args.SIGS.sig != NULL)
+                                        *(ev->ev_args.SIGS.sig) = sig;
+                                    pth_debug2("pth_sched_eventmanager: "
+                                               "[signal] event occurred for thread \"%s\"", t->name);
+                                    sigdelset(&g->sigraised, sig);
+                                    ev->ev_status = PTH_STATUS_OCCURRED;
+                                }
+                            }
+                        }
+                    }
+                }
+                /* (no post-processing of already occurred events is
+                   needed anymore: the condition variable signal flag
+                   machinery is gone) */
+
+                /* local to global mapping */
+                if (ev->ev_status != PTH_STATUS_PENDING)
+                    any_occurred = TRUE;
+            } while ((ev = ev->ev_next) != evh);
+        }
+
+        /* cancellation support */
+        if (t->cancelreq == TRUE) {
+            pth_debug2("pth_sched_eventmanager: cancellation request pending for thread \"%s\"", t->name);
+            any_occurred = TRUE;
+        }
+
+        /* walk to next thread in waiting queue */
+        tlast = t;
+        t = pth_pqueue_walk(&g->WQ, t, PTH_WALK_NEXT);
+
+        /*
+         * move last thread to ready queue if any events occurred for it.
+         * we insert it with a slightly increased queue priority to it a
+         * better chance to immediately get scheduled, else the last running
+         * thread might immediately get again the CPU which is usually not
+         * what we want, because we oven use pth_yield() calls to give others
+         * a chance.
+         */
+        if (any_occurred) {
+            pth_pqueue_delete(&g->WQ, tlast);
+            tlast->state = PTH_STATE_READY;
+            pth_pqueue_insert(&g->RQ, tlast->prio+1, tlast);
+            pth_debug2("pth_sched_eventmanager: thread \"%s\" moved from waiting "
+                       "to ready queue", tlast->name);
+        }
+    }
+
+    /* perhaps we have to internally loop... */
+    if (loop_repeat) {
+        pth_time_set(now, PTH_TIME_NOW);
+        goto loop_entry;
+    }
+
+    pth_debug1("pth_sched_eventmanager: leaving");
+    return;
+}
+#endif /* PTH_SCHED_EPOLL */
+
+
 /* fd-wait backend dispatcher: poll(2) when built with -DPTH_SCHED_POLL,
    the classic select(2) path otherwise (both share all non-fd logic) */
 intern void pth_sched_eventmanager(pth_time_t *now, int dopoll)
 {
-#ifdef PTH_SCHED_POLL
+#if defined(PTH_SCHED_EPOLL)
+    pth_sched_eventmanager_evport(now, dopoll);
+#elif defined(PTH_SCHED_POLL)
     pth_sched_eventmanager_poll(now, dopoll);
 #else
     pth_sched_eventmanager_select(now, dopoll);

@@ -955,3 +955,73 @@ check alongside `mcsc`. The full MP test suite passes with `bctx` as the context
 method on Linux/x86_64; macOS is exercised via CI. (The autoconf build still
 selects `mcsc`/`sjlj` only; `bctx` is wired through the CMake build, which is the
 supported build for this fork.)
+
+## 23. Scalable fd readiness: the epoll(7) scheduler backend (opt-in, `PTH_SCHED_EPOLL`)
+
+The `select(2)` and `poll(2)` scheduler cores (§12) both *rebuild and rescan the
+entire descriptor set on every scheduler pass*: a scheduler parked on N idle
+sockets pays an O(N) kernel scan each time it wakes for **any** reason. That is
+the classic C10K ceiling. `PTH_SCHED_EPOLL` replaces the per-pass scan with a
+persistent kernel interest set.
+
+**What it is (persistent registration).** Each scheduler owns its own `epoll`
+instance (created in `pth_scheduler_init`, closed in `pth_scheduler_kill`) plus
+an fd-indexed registration cache. The event manager gains a third variant,
+`pth_sched_eventmanager_evport`, generated from the `poll` variant so all of the
+non-fd logic (signals, timers, the wakeup-inbox drain, the `loop_repeat`
+machinery) is byte-identical; only the fd handling differs. Each pass:
+
+* `pth_evp_begin` bumps a generation counter;
+* assembly records the wanted `(fd, R/W/E)` mask via `pth_evp_want` (same O(n)
+  walk of the waiting queue as before, but now purely in user space);
+* `pth_evp_commit` diffs the wanted set against the cache and issues
+  `epoll_ctl` **only for genuine changes** — `ADD` for newly-waited fds, `MOD`
+  when the mask changed, `DEL` (a generation sweep over the registered list) for
+  fds no longer waited on;
+* `pth_evp_wait` calls `epoll_wait`, which returns **only the ready fds**
+  (O(ready), not O(watched)); readiness is stamped with the current generation
+  so the cleanup pass reads it with `pth_evp_ready`.
+
+So the expensive kernel scan of all N descriptors every pass is gone. The O(n)
+*user-space* walk of the waiting queue remains — that is the deliberate boundary
+of this change (see "persistent registration" vs a full event-driven rewrite):
+it keeps the proven event-manager structure and every event type working
+unchanged, while removing the syscall cost that actually dominates at scale. It
+is also the natural first step toward a fully event-driven loop later.
+
+**Self-healing `epoll_ctl`.** Because Pth has no `close(2)` wrapper, a descriptor
+a thread was waiting on can be closed (and its number reused) without the backend
+being told. The commit path is therefore defensive: `MOD` returning `ENOENT`
+(the kernel auto-dropped a closed fd) falls back to `ADD`; `ADD` returning
+`EEXIST` (a stale registration we lost track of) falls back to `MOD`; an `ADD`
+that fails outright (e.g. `EBADF`) marks the fd *ready* so the waiter's own I/O
+call returns the real error instead of blocking forever.
+
+**fd-reuse contract (limitation).** The one residual hazard is the same as every
+persistent-poller (libev's `ev_io_stop`, libevent): if an application closes a
+descriptor that a thread is *still waiting on* and immediately reuses the same
+number, on the same scheduler, with the *same* wait direction, all within one
+scheduler tick, a wakeup can be missed. Applications should not close descriptors
+out from under waiting threads (already true in general; only epoll is sensitive
+to reuse). The `select`/`poll` backends remain fully reuse-immune, so they stay
+the default; `PTH_SCHED_EPOLL` is strictly opt-in. A future `pth_close()` that
+evicts the fd from its scheduler's interest set would close this gap entirely.
+
+**No API/ABI impact.** This is a build-time backend selection only:
+`-DPTH_SCHED_EPOLL=ON` (Linux-only; it implies `PTH_SCHED_POLL` so the
+descriptor-value fast paths in `pth_high.c`/`pth_util.c` are active and there is
+no `FD_SETSIZE` ceiling). No public header, function, struct, or semantic
+changes; `pth_read`/`pth_select`/`pth_poll`/`pth_connect`/`pth_accept` behave
+identically. The dispatcher picks `evport` when `PTH_SCHED_EPOLL` is defined,
+else `poll` when `PTH_SCHED_POLL`, else classic `select`.
+
+**Testing.** The complete multi-scheduler suite passes against the epoll backend
+(sync/join/cancel/raise/suspend/msgports/once/network I/O/philosophers), plus a
+new `test_epoll_scale` that parks 120 readers across 3 schedulers simultaneously,
+wakes each selectively with its own byte, and then repeats after closing and
+reopening every socketpair (reusing the descriptor numbers) to drive the
+self-healing `epoll_ctl` paths. `test_epoll_scale` is backend-agnostic and also
+passes under `poll`/`select`. A `linux / MP + epoll + pthread` CI configuration
+builds and runs it on every push. `kqueue(2)` for FreeBSD/macOS is the planned
+follow-up: it reuses `evport` unchanged, implementing only the `pth_evp_*`
+primitives (`kevent` in place of `epoll_ctl`/`epoll_wait`).
