@@ -1,0 +1,12 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=@CMAKE_INSTALL_FULL_LIBDIR@
+includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
+
+Name: GNU Pth
+Description: GNU Portable Threads (multi-scheduler fork) - cooperative M:N threads
+URL: https://www.gnu.org/software/pth/
+Version: @PTH_VERSION_SHORT@
+Libs: -L${libdir} -lpth
+Libs.private: @PTH_PC_PRIVATE_LIBS@
+Cflags: -I${includedir}

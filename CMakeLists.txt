@@ -1,6 +1,6 @@
-# CMake build for GNU Pth (alternative to the autoconf build).
-# Replicates configure.ac: feature checks, generated headers
-# (pth.h, pth_acdef.h, pth_acmac.h, pth_p.h) and the library/test builds.
+# CMake build for GNU Pth.
+# Performs feature checks, generates headers
+# (pth.h, pth_acdef.h, pth_acmac.h, pth_p.h) and drives the library/test builds.
 
 cmake_minimum_required(VERSION 3.19)
 
@@ -43,11 +43,11 @@ option(PTH_SCHED_EPOLL  "Use epoll(7) persistent readiness in the scheduler core
 option(PTH_SCHED_KQUEUE "Use kqueue(2) persistent readiness in the scheduler core (*BSD/macOS only; implies PTH_SCHED_POLL; scales to many idle fds)" ${_kqueue_default})
 # BUILD_SHARED_LIBS selects static (default) vs shared library
 
-# mctx overrides (equivalent to --with-mctx-mth/dsp/stk); empty = autodetect
+# mctx override; empty = autodetect
 set(PTH_MCTX_MTH "" CACHE STRING "Force mctx method (mcsc, bctx)")
 
 if(PTH_BUILD_PTHREAD)
-    set(PTH_SYSCALL_SOFT ON)  # configure.ac forces this for --enable-pthread
+    set(PTH_SYSCALL_SOFT ON)  # required for the pthread emulation
 endif()
 if(PTH_MP AND PTH_BUILD_PTHREAD)
     # The emulation owns the pthread_* symbols, so the MP core reaches the
@@ -536,9 +536,18 @@ install(TARGETS pth
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES "${GEN}/pth.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/pth.3" DESTINATION "${CMAKE_INSTALL_MANDIR}/man3")
 if(PTH_BUILD_PTHREAD)
     install(TARGETS pth_pthread
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
     install(FILES "${GEN}/pthread.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pth)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/pthread.3" DESTINATION "${CMAKE_INSTALL_MANDIR}/man3")
 endif()
+
+set(PTH_PC_PRIVATE_LIBS "")
+if(PTH_MP)
+    set(PTH_PC_PRIVATE_LIBS "-pthread")
+endif()
+configure_file(pth.pc.in "${GEN}/pth.pc" @ONLY)
+install(FILES "${GEN}/pth.pc" DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")

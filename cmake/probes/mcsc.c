@@ -1,5 +1,5 @@
 /* Probe: usable SVR4/SUSv2 makecontext(2)/swapcontext(2)
-   (mirrors AC_CHECK_MCSC from aclocal.m4; exit 0 = usable) */
+   (exit 0 = usable) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <ucontext.h>

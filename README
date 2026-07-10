@@ -39,7 +39,7 @@
   o  Documented SMP memory model built on acquire/release atomics and
      validated under ThreadSanitizer.
   o  Modern CMake build with continuous integration on Linux, FreeBSD and
-     macOS; the classic autoconf build is retained for distro packaging.
+     macOS; the classic autoconf/libtool build has been removed.
   o  Platform scope narrowed to current targets (below); the legacy
      setjmp/sigaltstack machine-context "dispatch zoo" for long-dead
      platforms has been removed.
@@ -54,13 +54,11 @@
     o  bctx  -  Boost.Context (vendored fcontext assembly); default on
                 macOS, and selectable on any target.
 
-  Build systems:
-    o  CMake     -  recommended; supports all targets and both context
-                    methods; exercised by CI.
-    o  autoconf  -  retained for Linux/FreeBSD distro packaging (mcsc).
-                    For macOS / bctx, use the CMake build.
+  Build system:
+    o  CMake  -  the only build system; supports all targets and both
+                 context methods; exercised by CI. See INSTALL.
 
-  BUILDING (CMake)
+  BUILDING
 
     cmake -S . -B build -DPTH_BUILD_TESTS=ON
     cmake --build build
@@ -70,12 +68,6 @@
   -DPTH_SCHED_EPOLL / -DPTH_SCHED_KQUEUE (native readiness backend;
   default per platform), -DPTH_MCTX_MTH=mcsc|bctx, and
   -DPTH_BUILD_PTHREAD=ON (POSIX pthreads emulation; default OFF).
-
-  BUILDING (autoconf; Linux / FreeBSD)
-
-    ./configure
-    make
-    make test
 
   DOCUMENTATION
 
