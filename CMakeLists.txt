@@ -44,9 +44,7 @@ option(PTH_SCHED_KQUEUE "Use kqueue(2) persistent readiness in the scheduler cor
 # BUILD_SHARED_LIBS selects static (default) vs shared library
 
 # mctx overrides (equivalent to --with-mctx-mth/dsp/stk); empty = autodetect
-set(PTH_MCTX_MTH "" CACHE STRING "Force mctx method (mcsc, sjlj, bctx)")
-set(PTH_MCTX_DSP "" CACHE STRING "Force mctx dispatching (sc, ssjlj, sjlj, usjlj, sjlje, sjljlx, sjljisc, sjljw32)")
-set(PTH_MCTX_STK "" CACHE STRING "Force mctx stack setup (mc, ss, sas, none)")
+set(PTH_MCTX_MTH "" CACHE STRING "Force mctx method (mcsc, bctx)")
 
 if(PTH_BUILD_PTHREAD)
     set(PTH_SYSCALL_SOFT ON)  # configure.ac forces this for --enable-pthread
@@ -235,7 +233,15 @@ else()
     set(PTH_STACK_GROWTH "down")
 endif()
 
-# -- machine context decision (mirrors configure.ac) ---------------------------
+# -- machine context decision -------------------------------------------------
+# Supported targets: x86_64 / arm64 on Linux, FreeBSD, macOS. Retained methods:
+# mcsc (ucontext, Linux/FreeBSD) and bctx (Boost.Context fcontext, all targets).
+if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD|Darwin)$")
+    message(FATAL_ERROR "Unsupported OS '${CMAKE_SYSTEM_NAME}': this fork targets Linux, FreeBSD, macOS")
+endif()
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$")
+    message(FATAL_ERROR "Unsupported CPU '${CMAKE_SYSTEM_PROCESSOR}': this fork targets x86_64, arm64")
+endif()
 set(_mcsc_works FALSE)
 if(HAVE_UCONTEXT_H AND HAVE_MAKECONTEXT AND HAVE_SWAPCONTEXT
    AND HAVE_GETCONTEXT AND HAVE_SETCONTEXT)
@@ -251,74 +257,46 @@ endif()
 
 # Boost.Context (bctx) method: pick the vendored fcontext asm for this
 # architecture and object format (ELF vs Mach-O).
-set(_bctx_asm "")
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    if(APPLE)
-        set(_fmt macho)
-    else()
-        set(_fmt elf)
-    endif()
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-        set(_bctx_asm
-            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/jump_x86_64_sysv_${_fmt}_gas.S"
-            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/make_x86_64_sysv_${_fmt}_gas.S")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-        set(_bctx_asm
-            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/jump_arm64_aapcs_${_fmt}_gas.S"
-            "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/make_arm64_aapcs_${_fmt}_gas.S")
-    endif()
+if(APPLE)
+    set(_fmt macho)
+else()
+    set(_fmt elf)
 endif()
-set(_bctx_available FALSE)
-if(NOT "${_bctx_asm}" STREQUAL "")
-    set(_bctx_available TRUE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(_bctx_asm
+        "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/jump_x86_64_sysv_${_fmt}_gas.S"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/make_x86_64_sysv_${_fmt}_gas.S")
+else() # arm64 (arch guarded above)
+    set(_bctx_asm
+        "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/jump_arm64_aapcs_${_fmt}_gas.S"
+        "${CMAKE_CURRENT_SOURCE_DIR}/fcontext/make_arm64_aapcs_${_fmt}_gas.S")
 endif()
+set(_bctx_available TRUE)
 
 set(_mth "${PTH_MCTX_MTH}")
-set(_dsp "${PTH_MCTX_DSP}")
-set(_stk "${PTH_MCTX_STK}")
 if(_mth STREQUAL "")
-    if(APPLE AND _bctx_available)
+    if(APPLE)
         set(_mth bctx)     # ucontext(3) is deprecated/unreliable on macOS
     elseif(_mcsc_works)
         set(_mth mcsc)
-    elseif(_bctx_available)
-        set(_mth bctx)
-    elseif(HAVE_SIGSETJMP OR HAVE_SETJMP)
-        set(_mth sjlj)
     else()
-        message(FATAL_ERROR "no appropriate mctx method found")
+        set(_mth bctx)
     endif()
+endif()
+if(NOT (_mth STREQUAL "mcsc" OR _mth STREQUAL "bctx"))
+    message(FATAL_ERROR "PTH_MCTX_MTH must be 'mcsc' or 'bctx' (got '${_mth}')")
+endif()
+if(_mth STREQUAL "mcsc" AND NOT _mcsc_works)
+    message(FATAL_ERROR "PTH_MCTX_MTH=mcsc but ucontext(3) is unusable here; use -DPTH_MCTX_MTH=bctx")
 endif()
 if(_mth STREQUAL "bctx" AND NOT _bctx_available)
     message(FATAL_ERROR "PTH_MCTX_MTH=bctx: no vendored fcontext asm for "
                         "${CMAKE_SYSTEM_PROCESSOR} / ${CMAKE_SYSTEM_NAME}")
 endif()
-if(_dsp STREQUAL "")
-    if(_mth STREQUAL "mcsc" OR _mth STREQUAL "bctx")
-        set(_dsp sc)
-    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        set(_dsp sjljlx)
-    elseif(HAVE_SIGSETJMP)
-        set(_dsp ssjlj)
-    elseif(HAVE__SETJMP)
-        set(_dsp usjlj)
-    else()
-        set(_dsp sjlj)
-    endif()
-endif()
-if(_stk STREQUAL "")
-    if(_mth STREQUAL "mcsc" OR _mth STREQUAL "bctx")
-        set(_stk mc)
-    elseif(_dsp MATCHES "^(sjljlx|sjljisc|sjljw32)$")
-        set(_stk none)
-    elseif(HAVE_SIGALTSTACK)
-        set(_stk sas)
-    elseif(HAVE_SIGSTACK)
-        set(_stk ss)
-    else()
-        set(_stk none)
-    endif()
-endif()
+# mcsc and bctx both use single-primitive dispatch (sc) + makecontext-style
+# stack setup (mc); the sjlj dispatch/stack variants were removed.
+set(_dsp sc)
+set(_stk mc)
 set(PTH_MCTX_MTH_RESOLVED "${_mth}")
 set(PTH_MCTX_DSP_RESOLVED "${_dsp}")
 set(PTH_MCTX_STK_RESOLVED "${_stk}")
@@ -333,14 +311,6 @@ endif()
 
 # -- multi-scheduler (MP) requirements ----------------------------------------
 if(PTH_MP)
-    # the sjlj mctx variants bootstrap stacks via process-global state and a
-    # SIGUSR1 handler, which is unsafe with concurrent schedulers (see
-    # MULTISCHED-DESIGN.md section 7): require the reentrant makecontext variant
-    if(NOT (_mth STREQUAL "mcsc" OR _mth STREQUAL "bctx"))
-        message(FATAL_ERROR "PTH_MP requires the mcsc (makecontext/swapcontext) "
-                            "or bctx (Boost.Context) mctx method; detected/forced: "
-                            "${_mth}/${_dsp}/${_stk}")
-    endif()
     check_c_source_compiles("
         #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
         #include <stdatomic.h>
@@ -358,21 +328,6 @@ if(PTH_MP)
                             "builtins plus __thread TLS support")
     endif()
     find_package(Threads REQUIRED)
-endif()
-
-# sig{set,long}jmp flavor (for pth_acmac.h)
-if(_dsp MATCHES "^(ssjlj|sjljlx|sjljisc|sjljw32)$" OR (_dsp STREQUAL "sc" AND HAVE_SIGSETJMP))
-    set(pth_sigjmpbuf  "#define pth_sigjmpbuf sigjmp_buf")
-    set(pth_sigsetjmp  "#define pth_sigsetjmp(buf) sigsetjmp(buf,1)")
-    set(pth_siglongjmp "#define pth_siglongjmp(buf,val) siglongjmp(buf,val)")
-elseif(_dsp STREQUAL "usjlj")
-    set(pth_sigjmpbuf  "#define pth_sigjmpbuf jmp_buf")
-    set(pth_sigsetjmp  "#define pth_sigsetjmp(buf) _setjmp(buf)")
-    set(pth_siglongjmp "#define pth_siglongjmp(buf,val) _longjmp(buf,val)")
-else()
-    set(pth_sigjmpbuf  "#define pth_sigjmpbuf jmp_buf")
-    set(pth_sigsetjmp  "#define pth_sigsetjmp(buf) setjmp(buf)")
-    set(pth_siglongjmp "#define pth_siglongjmp(buf,val) longjmp(buf,val)")
 endif()
 
 # stack setup macros (for pth_acmac.h); probe prints "skaddr-expr,sksize-expr"
@@ -398,16 +353,6 @@ if(HAVE_MAKECONTEXT)
     pth_stacksetup2(makecontext TEST_makecontext)
 else()
     pth_stacksetup_split(makecontext "(skaddr),(sksize)")
-endif()
-if(HAVE_SIGALTSTACK)
-    pth_stacksetup2(sigaltstack TEST_sigaltstack)
-else()
-    pth_stacksetup_split(sigaltstack "(skaddr),(sksize)")
-endif()
-if(HAVE_SIGSTACK)
-    pth_stacksetup2(sigstack TEST_sigstack)
-else()
-    pth_stacksetup_split(sigstack "(skaddr),(sksize)")
 endif()
 
 # -- remaining substitution variables ------------------------------------------

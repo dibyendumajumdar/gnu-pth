@@ -26,18 +26,9 @@
 #ifndef _PTH_ACMAC_H_
 #define _PTH_ACMAC_H_
 
-/* sig{set,long}jmp macros */
-@pth_sigjmpbuf@
-@pth_sigsetjmp@
-@pth_siglongjmp@
-
 /* stack setup macros */
 #define pth_skaddr(func,skaddr,sksize) pth_skaddr_##func(skaddr,sksize)
 #define pth_sksize(func,skaddr,sksize) pth_sksize_##func(skaddr,sksize)
-@pth_skaddr_sigstack@
-@pth_sksize_sigstack@
-@pth_skaddr_sigaltstack@
-@pth_sksize_sigaltstack@
 @pth_skaddr_makecontext@
 @pth_sksize_makecontext@
 
@@ -45,21 +36,11 @@
 #define PTH_MCTX_MTH(which)  (PTH_MCTX_MTH_use == (PTH_MCTX_MTH_##which))
 #define PTH_MCTX_DSP(which)  (PTH_MCTX_DSP_use == (PTH_MCTX_DSP_##which))
 #define PTH_MCTX_STK(which)  (PTH_MCTX_STK_use == (PTH_MCTX_STK_##which))
+/* methods retained: mcsc = ucontext (Linux/FreeBSD), bctx = Boost.Context */
 #define PTH_MCTX_MTH_mcsc    1
-#define PTH_MCTX_MTH_sjlj    2
 #define PTH_MCTX_MTH_bctx    3
 #define PTH_MCTX_DSP_sc      1
-#define PTH_MCTX_DSP_ssjlj   2
-#define PTH_MCTX_DSP_sjlj    3
-#define PTH_MCTX_DSP_usjlj   4
-#define PTH_MCTX_DSP_sjlje   5
-#define PTH_MCTX_DSP_sjljlx  6
-#define PTH_MCTX_DSP_sjljisc 7
-#define PTH_MCTX_DSP_sjljw32 8
 #define PTH_MCTX_STK_mc      1
-#define PTH_MCTX_STK_ss      2
-#define PTH_MCTX_STK_sas     3
-#define PTH_MCTX_STK_none    4
 
 #endif /* _PTH_ACMAC_H_ */
 

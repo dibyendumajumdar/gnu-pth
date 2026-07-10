@@ -1,4 +1,103 @@
    ____  _   _
+  |  _ \| |_| |__                     GNU Pth - Multi-Scheduler Fork
+  | |_) | __| '_ \                    Portable cooperative threads,
+  |  __/| |_| | | |                    now M:N across multiple CPUs.
+  |_|    \__|_| |_|
+
+  ABOUT THIS FORK
+
+  This is a modernized fork of GNU Pth (Ralf S. Engelschall's Portable
+  Threads). Classic Pth multiplexes many cooperative "green" threads onto
+  a SINGLE OS thread on a single CPU. This fork adds a multi-scheduler
+  (M:N) mode: N independent cooperative schedulers, each on its own OS
+  thread, so green threads run in parallel on multiple cores -- while
+  still being written as straight-line, blocking-style code through Pth's
+  native API (or its optional POSIX pthreads emulation).
+
+  You still write ordinary sequential code -- pth_read() just returns
+  bytes -- but the library can now use more than one CPU, wait on large
+  numbers of descriptors efficiently via epoll(7)/kqueue(2), and switch
+  contexts portably (including Apple Silicon) via Boost.Context.
+
+  The full design, rationale, memory model, benchmarks and analysis are
+  in MULTISCHED-DESIGN.md.
+
+  KEY ENHANCEMENTS OVER UPSTREAM 2.0.7
+
+  o  Multi-scheduler M:N threading (PTH_MP): N cooperative schedulers on
+     N OS threads; green threads pinned to a home scheduler. New API:
+     pth_mp_init(), pth_mp_shutdown(), pth_spawn_on(), pth_sched_id().
+  o  Every thread-control primitive works across schedulers: mutex
+     (incl. fair ownership handoff), condition variable, rwlock, barrier,
+     join, cancel/abort/raise, suspend/resume/yield, message ports, once.
+  o  Scalable fd-readiness backends: persistent-registration epoll(7)
+     (Linux) and kqueue(2) (*BSD/macOS), with poll(2)/select(2) retained
+     as close-safe fallbacks. The native backend is the per-platform
+     default.
+  o  Portable context switching via Boost.Context fcontext ("bctx"),
+     required on macOS/Apple Silicon where ucontext(3) is unusable.
+  o  Documented SMP memory model built on acquire/release atomics and
+     validated under ThreadSanitizer.
+  o  Modern CMake build with continuous integration on Linux, FreeBSD and
+     macOS; the classic autoconf build is retained for distro packaging.
+  o  Platform scope narrowed to current targets (below); the legacy
+     setjmp/sigaltstack machine-context "dispatch zoo" for long-dead
+     platforms has been removed.
+
+  SUPPORTED PLATFORMS
+
+  CPU:  x86_64 (Intel/AMD 64-bit) and arm64 / aarch64.
+  OS:   Linux, FreeBSD, macOS.
+
+  Machine-context method:
+    o  mcsc  -  ucontext(3); default on Linux and FreeBSD.
+    o  bctx  -  Boost.Context (vendored fcontext assembly); default on
+                macOS, and selectable on any target.
+
+  Build systems:
+    o  CMake     -  recommended; supports all targets and both context
+                    methods; exercised by CI.
+    o  autoconf  -  retained for Linux/FreeBSD distro packaging (mcsc).
+                    For macOS / bctx, use the CMake build.
+
+  BUILDING (CMake)
+
+    cmake -S . -B build -DPTH_BUILD_TESTS=ON
+    cmake --build build
+    ctest --test-dir build --output-on-failure
+
+  Notable options: -DPTH_MP=ON (multi-scheduler; default ON),
+  -DPTH_SCHED_EPOLL / -DPTH_SCHED_KQUEUE (native readiness backend;
+  default per platform), -DPTH_MCTX_MTH=mcsc|bctx, and
+  -DPTH_BUILD_PTHREAD=ON (POSIX pthreads emulation; default OFF).
+
+  BUILDING (autoconf; Linux / FreeBSD)
+
+    ./configure
+    make
+    make test
+
+  DOCUMENTATION
+
+  o  MULTISCHED-DESIGN.md  -  full design of the M:N fork (architecture,
+     backends, memory model, benchmarks, comparison with other runtimes).
+  o  pth(3) man page (pth.pod / pth.3)  -  the API reference.
+  o  REVIEW.md  -  code-review history and resolutions.
+
+  LICENSE
+
+  Unchanged: GNU Lesser General Public License, version 2.1 or later.
+  Copyright (c) 1999-2006 Ralf S. Engelschall (original Pth); fork
+  modifications are under the same LGPL. The vendored Boost.Context
+  assembly under fcontext/ is under the Boost Software License 1.0.
+
+  ======================================================================
+  LEGACY: the original GNU Pth 2.0.7 README follows, retained verbatim
+  for historical reference and credits. The version number, platform
+  list and feature notes below describe UPSTREAM Pth, not this fork.
+  ======================================================================
+
+   ____  _   _
   |  _ \| |_| |__
   | |_) | __| '_ \                    ``Only those who attempt
   |  __/| |_| | | |                     the absurd can achieve
