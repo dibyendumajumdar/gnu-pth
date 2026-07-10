@@ -1,25 +1,12 @@
 # ThreadSanitizer suppressions for GNU Pth multi-scheduler (MP) mode.
 #
 # This file lists the KNOWN-BENIGN data races so a TSan run can gate on the
-# ABSENCE of any other (real) race. Each entry is justified below; the one real
-# MP race TSan found -- mutex->mx_node manipulated outside mx_lock -- was fixed
-# in code (pth_sync.c), not suppressed. See MULTISCHED-DESIGN.md section 24.
+# ABSENCE of any other (real) race. Synchronization-primitive state validation
+# uses atomic loads and is intentionally not suppressed: a function-level
+# suppression there could hide unrelated waiter/owner/ring races. See
+# MULTISCHED-DESIGN.md section 24.
 #
-# (1) The synchronization primitives validate their INITIALIZED bit by reading
-#     the state word BEFORE taking the object's spinlock (they must: the lock is
-#     inside the object and cannot be taken on uninitialized memory). That read
-#     races with the LOCKED/FAIR/RD/WR bits being flipped under the lock by
-#     another scheduler, but PTH_*_INITIALIZED is set once before the object is
-#     ever shared and never changes, so the observed validity is always correct.
-#     It is a benign read of an immutable-after-publication flag.
-race:pth_mutex_acquire
-race:pth_mutex_release
-race:pth_rwlock_acquire
-race:pth_rwlock_release
-race:pth_cond_await
-race:pth_cond_notify
-#
-# (2) During pth_mp_shutdown(), each auxiliary scheduler -- having run dry after
+# During pth_mp_shutdown(), each auxiliary scheduler -- having run dry after
 #     a PTH_GMSG_STOP and been joined -- tears down its own per-scheduler state
 #     (closes its self-pipe, frees its epoll/kqueue buffers) on its own OS
 #     thread. This can race with a peer that is shutting down at the same instant

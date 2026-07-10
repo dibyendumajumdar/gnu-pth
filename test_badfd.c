@@ -41,14 +41,14 @@ int main(void)
            rc < 0 ? "(error: correct)"
                   : (rc == 0 ? "(timeout)" : "(READY: WRONG)"));
 
-    /* the invalid descriptor must never be reported ready */
-    if (rc > 0) {
-        printf("bad descriptor reported ready -- FAIL\n");
+    /* All backends must report the same immediate select(2) failure.  In
+       particular, rc == 0 means the auxiliary timeout fired and the bad-fd
+       event was stranded, which is a test failure rather than a pass. */
+    if (rc != -1 || errno != EBADF) {
+        printf("want rc=-1, errno=EBADF; got rc=%d, errno=%d (%s) -- FAIL\n",
+               rc, errno, strerror(errno));
         fails++;
     }
-    /* the classic/poll/epoll/kqueue behaviour is an immediate EBADF error */
-    if (rc < 0 && errno != EBADF)
-        printf("note: error was %s (any error is acceptable here)\n", strerror(errno));
 
     pth_kill();
     printf(fails == 0 ? "ALL BADFD TESTS PASSED\n" : "%d BADFD TESTS FAILED\n", fails);

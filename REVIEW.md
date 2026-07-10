@@ -511,3 +511,24 @@ successfully. Twenty tests reached completion and passed, including
 cancellation tests. `test_netio_mp` hit its 120-second CTest timeout in this
 restricted environment, matching the sandbox-sensitive limitation recorded in
 the earlier review; it is not reported here as a new product finding.
+
+
+---
+
+## Fifth Follow-up Resolution
+
+### Medium — `test_badfd` passes on timeout: FIXED
+
+`test_badfd.c` now requires exactly `rc == -1` with `errno == EBADF`. A zero
+return from the three-second auxiliary timeout, a false-ready result, or a
+different error all fail the test, so the regression test now enforces both the
+liveness and cross-backend failure contract it documents.
+
+### Medium — broad primitive TSan suppressions: FIXED
+
+Synchronization primitive state validation now uses atomic loads, and every
+mutation of the mutex state word uses atomic stores. Initialization of mutex,
+rwlock, condition-variable, and barrier state words is atomic as well. The six
+function-level primitive suppressions were removed from `pth.tsan.supp`, so TSan
+can report unrelated races in waiter queues, ownership, counts, and mutex rings.
+The design document's TSan section was updated to describe the stronger gate.

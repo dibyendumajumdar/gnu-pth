@@ -99,7 +99,7 @@ int pth_mutex_init(pth_mutex_t *mutex)
 {
     if (mutex == NULL)
         return pth_error(FALSE, EINVAL);
-    mutex->mx_state = PTH_MUTEX_INITIALIZED;
+    pth_atomic_store(&mutex->mx_state, PTH_MUTEX_INITIALIZED);
     mutex->mx_owner = NULL;
     mutex->mx_count = 0;
     pth_spin_init(&mutex->mx_lock);
@@ -116,13 +116,15 @@ int pth_mutex_setfair(pth_mutex_t *mutex, int fair)
 {
     if (mutex == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(mutex->mx_state & PTH_MUTEX_INITIALIZED))
+    if (!(pth_atomic_load(&mutex->mx_state) & PTH_MUTEX_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
     pth_spin_lock(&mutex->mx_lock);
     if (fair)
-        mutex->mx_state |= PTH_MUTEX_FAIR;
+        pth_atomic_store(&mutex->mx_state,
+                         pth_atomic_load(&mutex->mx_state) | PTH_MUTEX_FAIR);
     else
-        mutex->mx_state &= ~PTH_MUTEX_FAIR;
+        pth_atomic_store(&mutex->mx_state,
+                         pth_atomic_load(&mutex->mx_state) & ~PTH_MUTEX_FAIR);
     pth_spin_unlock(&mutex->mx_lock);
     return TRUE;
 }
@@ -149,7 +151,8 @@ static void pth_mutex_wait_cleanup(void *arg)
             pth_gsched_wake(w->sched_home, w, w->wq_event);
             return;
         }
-        mutex->mx_state &= ~(PTH_MUTEX_LOCKED);
+        pth_atomic_store(&mutex->mx_state,
+                         pth_atomic_load(&mutex->mx_state) & ~PTH_MUTEX_LOCKED);
         mutex->mx_owner = NULL;
         mutex->mx_count = 0;
     }
@@ -169,14 +172,15 @@ int pth_mutex_acquire(pth_mutex_t *mutex, int tryonly, pth_event_t ev_extra)
     /* consistency checks */
     if (mutex == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(mutex->mx_state & PTH_MUTEX_INITIALIZED))
+    if (!(pth_atomic_load(&mutex->mx_state) & PTH_MUTEX_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
 
     pth_spin_lock(&mutex->mx_lock);
 
     /* still not locked, so simply acquire mutex? */
-    if (!(mutex->mx_state & PTH_MUTEX_LOCKED)) {
-        mutex->mx_state |= PTH_MUTEX_LOCKED;
+    if (!(pth_atomic_load(&mutex->mx_state) & PTH_MUTEX_LOCKED)) {
+        pth_atomic_store(&mutex->mx_state,
+                         pth_atomic_load(&mutex->mx_state) | PTH_MUTEX_LOCKED);
         mutex->mx_owner = pth_current;
         mutex->mx_count = 1;
         pth_ring_append(&(pth_current->mutexring), &(mutex->mx_node));
@@ -237,14 +241,15 @@ int pth_mutex_acquire(pth_mutex_t *mutex, int tryonly, pth_event_t ev_extra)
                 return pth_error(FALSE, EINTR);
             }
         }
-        if (!(mutex->mx_state & PTH_MUTEX_LOCKED))
+        if (!(pth_atomic_load(&mutex->mx_state) & PTH_MUTEX_LOCKED))
             break;
         /* someone else barged in between wakeup and here: park again */
     }
 
     /* now it's again unlocked, so acquire mutex (spinlock still held) */
     pth_debug1("pth_mutex_acquire: locking mutex");
-    mutex->mx_state |= PTH_MUTEX_LOCKED;
+    pth_atomic_store(&mutex->mx_state,
+                     pth_atomic_load(&mutex->mx_state) | PTH_MUTEX_LOCKED);
     mutex->mx_owner = pth_current;
     mutex->mx_count = 1;
     pth_ring_append(&(pth_current->mutexring), &(mutex->mx_node));
@@ -259,9 +264,9 @@ int pth_mutex_release(pth_mutex_t *mutex)
     /* consistency checks */
     if (mutex == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(mutex->mx_state & PTH_MUTEX_INITIALIZED))
+    if (!(pth_atomic_load(&mutex->mx_state) & PTH_MUTEX_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
-    if (!(mutex->mx_state & PTH_MUTEX_LOCKED))
+    if (!(pth_atomic_load(&mutex->mx_state) & PTH_MUTEX_LOCKED))
         return pth_error(FALSE, EDEADLK);
     if (mutex->mx_owner != pth_current)
         return pth_error(FALSE, EACCES);
@@ -271,7 +276,7 @@ int pth_mutex_release(pth_mutex_t *mutex)
     mutex->mx_count--;
     if (mutex->mx_count <= 0) {
         w = pth_waitq_shift(&mutex->mx_waitq);
-        if (w != NULL && (mutex->mx_state & PTH_MUTEX_FAIR)) {
+        if (w != NULL && (pth_atomic_load(&mutex->mx_state) & PTH_MUTEX_FAIR)) {
             /* fair mode: hand ownership directly to the first waiter so no
                newly arriving thread can barge ahead of the queue. The mutex
                stays LOCKED throughout; the woken waiter finds itself already
@@ -286,7 +291,8 @@ int pth_mutex_release(pth_mutex_t *mutex)
         else {
             /* barging mode (default): drop the lock and wake one waiter,
                which re-contends for the mutex on resume */
-            mutex->mx_state &= ~(PTH_MUTEX_LOCKED);
+            pth_atomic_store(&mutex->mx_state,
+                             pth_atomic_load(&mutex->mx_state) & ~PTH_MUTEX_LOCKED);
             mutex->mx_owner = NULL;
             mutex->mx_count = 0;
             pth_ring_delete(&(pth_current->mutexring), &(mutex->mx_node));
@@ -335,7 +341,7 @@ int pth_rwlock_init(pth_rwlock_t *rwlock)
 {
     if (rwlock == NULL)
         return pth_error(FALSE, EINVAL);
-    rwlock->rw_state   = PTH_RWLOCK_INITIALIZED;
+    pth_atomic_store(&rwlock->rw_state, PTH_RWLOCK_INITIALIZED);
     rwlock->rw_mode    = PTH_RWLOCK_RD;
     rwlock->rw_readers = 0;
     rwlock->rw_owner   = NULL;
@@ -368,7 +374,7 @@ int pth_rwlock_acquire(pth_rwlock_t *rwlock, int op, int tryonly, pth_event_t ev
     /* consistency checks */
     if (rwlock == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(rwlock->rw_state & PTH_RWLOCK_INITIALIZED))
+    if (!(pth_atomic_load(&rwlock->rw_state) & PTH_RWLOCK_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
 
     pth_spin_lock(&rwlock->rw_lock);
@@ -448,7 +454,7 @@ int pth_rwlock_release(pth_rwlock_t *rwlock)
     /* consistency checks */
     if (rwlock == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(rwlock->rw_state & PTH_RWLOCK_INITIALIZED))
+    if (!(pth_atomic_load(&rwlock->rw_state) & PTH_RWLOCK_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
 
     pth_spin_lock(&rwlock->rw_lock);
@@ -506,7 +512,7 @@ int pth_cond_init(pth_cond_t *cond)
 {
     if (cond == NULL)
         return pth_error(FALSE, EINVAL);
-    cond->cn_state   = PTH_COND_INITIALIZED;
+    pth_atomic_store(&cond->cn_state, PTH_COND_INITIALIZED);
     cond->cn_waiters = 0;
     pth_spin_init(&cond->cn_lock);
     pth_waitq_init(&cond->cn_waitq);
@@ -540,7 +546,7 @@ int pth_cond_await(pth_cond_t *cond, pth_mutex_t *mutex, pth_event_t ev_extra)
     /* consistency checks */
     if (cond == NULL || mutex == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(cond->cn_state & PTH_COND_INITIALIZED))
+    if (!(pth_atomic_load(&cond->cn_state) & PTH_COND_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
 
     /* build the event(s) to wait for */
@@ -589,7 +595,7 @@ int pth_cond_notify(pth_cond_t *cond, int broadcast)
     /* consistency checks */
     if (cond == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(cond->cn_state & PTH_COND_INITIALIZED))
+    if (!(pth_atomic_load(&cond->cn_state) & PTH_COND_INITIALIZED))
         return pth_error(FALSE, EDEADLK);
 
     /* dequeue one (or all) waiters and hand each a directed wakeup;
@@ -630,7 +636,7 @@ int pth_barrier_init(pth_barrier_t *barrier, int threshold)
         return FALSE;
     if (!pth_cond_init(&(barrier->br_cond)))
         return FALSE;
-    barrier->br_state     = PTH_BARRIER_INITIALIZED;
+    pth_atomic_store(&barrier->br_state, PTH_BARRIER_INITIALIZED);
     barrier->br_threshold = threshold;
     barrier->br_count     = threshold;
     barrier->br_cycle     = FALSE;
@@ -644,7 +650,7 @@ int pth_barrier_reach(pth_barrier_t *barrier)
 
     if (barrier == NULL)
         return pth_error(FALSE, EINVAL);
-    if (!(barrier->br_state & PTH_BARRIER_INITIALIZED))
+    if (!(pth_atomic_load(&barrier->br_state) & PTH_BARRIER_INITIALIZED))
         return pth_error(FALSE, EINVAL);
 
     if (!pth_mutex_acquire(&(barrier->br_mutex), FALSE, NULL))

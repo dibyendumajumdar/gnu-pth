@@ -1241,16 +1241,13 @@ It was fixed by moving those ring operations inside the lock (`pth_sync.c`). Two
 non-atomic reads of atomically-written words (the spinlock's TTAS back-off read
 and the Treiber inbox head) were also made atomic.
 
-After those fixes the only remaining reports are two documented **benign** races,
-listed in `pth.tsan.supp` so the CI run gates on the absence of any *other*
-race: (a) the primitives read their state word to check the immutable
-`INITIALIZED` bit before taking the object's spinlock (they must -- the lock
-lives inside the object), which races with the `LOCKED`/`FAIR` bits being flipped
-under the lock but never observes a wrong value for the immutable bit; and (b)
-per-scheduler teardown during `pth_mp_shutdown` closes a self-pipe / frees the
-poller buffers after the schedulers have run dry. Neither affects live data. A
-full-atomic state word (a) and a two-phase shutdown (b) would remove even these,
-and are noted as possible future cleanups.
+Primitive state words are now accessed atomically, including the pre-lock
+`INITIALIZED` validation. This avoids both the benign state-word report and the
+need for broad function-level suppressions that could hide an unrelated race in
+waiter, owner, or ring handling. The only remaining documented benign report in
+`pth.tsan.supp` is per-scheduler teardown during `pth_mp_shutdown`, which closes
+a self-pipe / frees poller buffers after the schedulers have run dry. A two-phase
+shutdown would remove that final suppression and remains a possible cleanup.
 
 ### Throughput: same-scheduler vs cross-scheduler hand-off
 
