@@ -532,3 +532,33 @@ rwlock, condition-variable, and barrier state words is atomic as well. The six
 function-level primitive suppressions were removed from `pth.tsan.supp`, so TSan
 can report unrelated races in waiter queues, ownership, counts, and mutex rings.
 The design document's TSan section was updated to describe the stronger gate.
+
+
+---
+
+## Sixth Follow-up Review: Open Finding
+
+### Medium: `test_syncbench` does not isolate the cross-scheduler wakeup penalty
+
+`test_syncbench.c` reports cross-scheduler handoffs as faster than
+same-scheduler handoffs on native Linux. This is reproducible rather than normal
+measurement noise: five local runs showed same-scheduler throughput around
+69--72k handoffs/s versus roughly 121--126k handoffs/s across schedulers.
+
+The result comes from an asymmetric scheduling path in `pth_cond_notify()`
+(`pth_sync.c`). When the dequeued waiter belongs to the current scheduler,
+`pth_cond_notify()` calls `pth_yield(NULL)` immediately. The benchmark invokes
+notify while still holding the shared mutex, as is normal for condition-variable
+use. The local waiter therefore runs immediately, tries to reacquire the mutex,
+and blocks again; the notifier must resume, release the mutex, and wake/schedule
+the waiter a second time. A remote notification does not yield locally: it posts
+to the target scheduler and returns, so the notifier normally releases the
+mutex before the remote waiter resumes.
+
+Consequently the benchmark currently measures the local eager-yield penalty
+against asynchronous remote delivery, rather than isolating the cost of a
+cross-scheduler mutex/condition-variable handoff. The result does not establish
+that cross-scheduler mutexes are intrinsically faster. The eager local yield in
+`pth_cond_notify()` should be reconsidered (especially for the conventional
+notify-while-holding-the-mutex pattern), and the benchmark should be rerun or
+redesigned after both paths have equivalent scheduling semantics.
