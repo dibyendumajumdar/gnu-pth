@@ -304,7 +304,7 @@ intern int pth_gsched_post(pth_gsched_t *g, int kind, pth_t t, pth_event_t ev)
     m->event  = ev;
     m->sig    = 0;
     do {
-        head = g->inbox;
+        head = pth_atomic_ptr_load(&g->inbox);
         m->next = (pth_gmsg_t *)head;
     } while (!pth_atomic_ptr_cas(&g->inbox, head, m));
     if (g != pth_gsched_active)
@@ -330,7 +330,7 @@ intern int pth_gsched_post_raise(pth_gsched_t *g, pth_t t, int sig)
     m->event  = NULL;
     m->sig    = sig;
     do {
-        head = g->inbox;
+        head = pth_atomic_ptr_load(&g->inbox);
         m->next = (pth_gmsg_t *)head;
     } while (!pth_atomic_ptr_cas(&g->inbox, head, m));
     if (g != pth_gsched_active)

@@ -57,6 +57,10 @@ static inline void *pth_atomic_ptr_xchg(void * volatile *p, void *v)
 {
     return __atomic_exchange_n((void **)p, v, __ATOMIC_SEQ_CST);
 }
+static inline void *pth_atomic_ptr_load(void * volatile *p)
+{
+    return __atomic_load_n((void **)p, __ATOMIC_ACQUIRE);
+}
 
 /*
  * spinlock on a plain `volatile int' word (test-and-test-and-set).
@@ -77,8 +81,8 @@ static inline void pth_spin_lock(volatile int *l)
     for (;;) {
         if (pth_spin_trylock(l))
             return;
-        while (*l != 0)
-            /* spin on the (cached) read before retrying the RMW */ ;
+        while (__atomic_load_n(l, __ATOMIC_RELAXED) != 0)
+            /* spin on the (relaxed) read before retrying the RMW */ ;
     }
 }
 static inline void pth_spin_unlock(volatile int *l)
@@ -111,6 +115,10 @@ static inline void *pth_atomic_ptr_xchg(void * volatile *p, void *v)
     void *old = *(void **)p;
     *p = v;
     return old;
+}
+static inline void *pth_atomic_ptr_load(void * volatile *p)
+{
+    return *(void **)p;
 }
 
 #define PTH_SPIN_INIT 0

@@ -179,8 +179,8 @@ int pth_mutex_acquire(pth_mutex_t *mutex, int tryonly, pth_event_t ev_extra)
         mutex->mx_state |= PTH_MUTEX_LOCKED;
         mutex->mx_owner = pth_current;
         mutex->mx_count = 1;
-        pth_spin_unlock(&mutex->mx_lock);
         pth_ring_append(&(pth_current->mutexring), &(mutex->mx_node));
+        pth_spin_unlock(&mutex->mx_lock);
         pth_debug1("pth_mutex_acquire: immediately locking mutex");
         return TRUE;
     }
@@ -221,10 +221,10 @@ int pth_mutex_acquire(pth_mutex_t *mutex, int tryonly, pth_event_t ev_extra)
            (mutex kept LOCKED, mx_owner set to us, and we were already
            dequeued). Recognise that and take the lock without re-contending. */
         if (mutex->mx_owner == pth_current) {
+            pth_ring_append(&(pth_current->mutexring), &(mutex->mx_node));
             pth_spin_unlock(&mutex->mx_lock);
             if (ev_extra != NULL)
                 pth_event_isolate(ev);
-            pth_ring_append(&(pth_current->mutexring), &(mutex->mx_node));
             pth_debug1("pth_mutex_acquire: acquired mutex via fair handoff");
             return TRUE;
         }
@@ -247,8 +247,8 @@ int pth_mutex_acquire(pth_mutex_t *mutex, int tryonly, pth_event_t ev_extra)
     mutex->mx_state |= PTH_MUTEX_LOCKED;
     mutex->mx_owner = pth_current;
     mutex->mx_count = 1;
-    pth_spin_unlock(&mutex->mx_lock);
     pth_ring_append(&(pth_current->mutexring), &(mutex->mx_node));
+    pth_spin_unlock(&mutex->mx_lock);
     return TRUE;
 }
 
@@ -279,8 +279,8 @@ int pth_mutex_release(pth_mutex_t *mutex)
                not touch a foreign thread's ring). */
             mutex->mx_owner = w;
             mutex->mx_count = 1;
-            pth_spin_unlock(&mutex->mx_lock);
             pth_ring_delete(&(pth_current->mutexring), &(mutex->mx_node));
+            pth_spin_unlock(&mutex->mx_lock);
             pth_gsched_wake(w->sched_home, w, w->wq_event);
         }
         else {
@@ -289,8 +289,8 @@ int pth_mutex_release(pth_mutex_t *mutex)
             mutex->mx_state &= ~(PTH_MUTEX_LOCKED);
             mutex->mx_owner = NULL;
             mutex->mx_count = 0;
-            pth_spin_unlock(&mutex->mx_lock);
             pth_ring_delete(&(pth_current->mutexring), &(mutex->mx_node));
+            pth_spin_unlock(&mutex->mx_lock);
             if (w != NULL)
                 pth_gsched_wake(w->sched_home, w, w->wq_event);
         }

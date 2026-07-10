@@ -1083,3 +1083,389 @@ they keep exercising those paths. This is still a build-time choice with no
 public API/ABI change; the fd-reuse contract above now applies by default on
 those platforms, which is why the reuse-immune poll/select paths are retained as
 first-class, explicitly selectable fallbacks.
+
+## 24. Memory model
+
+Classic Pth ran every thread on a single OS thread, so it needed *no*
+inter-thread memory ordering at all: cooperative context switches on one CPU are
+sequential, and a green thread only ever observed memory it had itself written.
+The M:N port breaks that assumption -- N schedulers run on N OS threads on N
+CPUs -- so any state touched by more than one scheduler now needs real memory
+ordering. This section records how that ordering is established, the invariants
+it rests on, and what a future work-stealing scheduler would have to add.
+
+### It is memory *ordering*, not cache flushing
+
+On every platform this targets (x86-64, arm64, and the other cache-coherent SMP
+architectures) the hardware keeps caches coherent automatically; software never
+flushes a cache line to make a write visible to another core. The real hazards
+are (a) the compiler reordering accesses or holding a value in a register across
+a critical section, and (b) the CPU reordering loads/stores around a lock on a
+weakly-ordered architecture (arm64, POWER). Both are defeated by *acquire*
+semantics when taking a lock and *release* semantics when dropping it, which
+together form the happens-before edge that carries the protected data between
+threads.
+
+### Where the ordering comes from
+
+All of it lives in `pth_atomic.h`, and every shared primitive is built on it:
+
+* **Spinlocks** (`pth_spin_lock`/`pth_spin_unlock`) guard the internal state of
+  every synchronization object -- `mx_lock` in a mutex, `cn_lock` in a condition
+  variable, `rw_lock` in an rwlock, the per-port `mp_lock`, the join lock, etc.
+  They are a test-and-test-and-set on a plain `volatile int` using
+  `__atomic_test_and_set(l, __ATOMIC_ACQUIRE)` to lock and
+  `__atomic_clear(l, __ATOMIC_RELEASE)` to unlock.
+* **Atomic integers/pointers** (`pth_atomic_load/store/inc/dec/cas`,
+  `pth_atomic_ptr_cas/xchg`) use `__ATOMIC_SEQ_CST`. These drive the `pth_once`
+  state machine and the lock-free MPSC wakeup inbox.
+* When `PTH_MP` is not defined every one of these degrades to the trivial
+  non-atomic version, so single-scheduler builds pay nothing and the common code
+  is written once.
+
+Because the `__atomic` builtins lower to the correct per-architecture
+instructions, the same source is correct on strong and weak memory models: on
+x86 the `LOCK`-prefixed RMW is already a full barrier (so this is nearly free);
+on arm64 the builtins emit load-acquire / store-release (or a `DMB`) that x86's
+TSO model would have given implicitly.
+
+### The happens-before chain for user data
+
+Take the canonical hand-off of data protected by a `pth_mutex`:
+
+```
+thread A (scheduler 0)          thread B (scheduler 1)
+  pth_mutex_acquire(&m)
+  shared = 42;                    ...
+  pth_mutex_release(&m)  --------> pth_mutex_acquire(&m)
+                                   x = shared;   /* observes 42 */
+                                   pth_mutex_release(&m)
+```
+
+`pth_mutex_release` performs a **release** on `m.mx_lock`; `pth_mutex_acquire`
+performs an **acquire** on the same word. When B's acquire reads the value A's
+release stored, release/acquire synchronization orders everything A did before
+the release before everything B does after the acquire -- so B is guaranteed to
+see `shared == 42`. This holds on both the uncontended fast path and the
+contended slow path: when B cannot take the mutex it parks, and A's release
+wakes it. If A and B are on different schedulers that wake crosses OS threads
+through the SEQ_CST Treiber inbox (`pth_atomic_ptr_xchg`/`_cas` on push and
+drain) plus a self-pipe kick, so the inbox hand-off carries the ordering too.
+Every path that moves control or data between schedulers -- primitive locks,
+the wakeup inbox, the `pth_once` control -- passes through one of these atomic
+operations.
+
+### The context-switch method is orthogonal
+
+The machine-context method (`mcsc`/ucontext, `sjlj`/setjmp, or `bctx`/fcontext)
+has *nothing* to do with the cross-thread memory model, for two reasons:
+
+1. A context switch only ever swaps stacks **within a single scheduler**, i.e.
+   within one OS thread on one CPU. It never crosses cores, so it needs no
+   cross-thread barrier of its own.
+2. `swapcontext()` and `jump_fcontext()` are opaque, non-inlinable calls, so they
+   already act as compiler barriers: the compiler cannot reorder memory accesses
+   across them or keep a value in a register through them, which is all the
+   switch itself requires.
+
+So replacing ucontext with Boost.Context (§22) changed nothing here; the ordering
+was, and remains, entirely in the atomics.
+
+### Invariants this rests on
+
+1. **Threads are pinned to their home scheduler.** A given green thread's memory
+   accesses therefore all happen on one OS thread, in cooperative program order,
+   and need no synchronization *among themselves*. There is no migration and no
+   work-stealing.
+2. **Single-writer ownership.** A TCB and its five run queues (NQ/RQ/WQ/SQ/DQ)
+   are mutated only by the home scheduler. This is what keeps the *bulk* of the
+   runtime lock-free: most state has exactly one writer. Anything another
+   scheduler needs to effect is sent as a message to the owner's inbox rather
+   than written directly.
+3. **Genuinely shared state is explicitly synchronized.** The synchronization
+   primitives' internals, the `pth_once` control, the message-port registry and
+   per-port queues, and the wakeup inbox are the only cross-scheduler shared
+   mutable state, and each is guarded by the atomics above. A few reads are
+   deliberately lock-free where they are provably safe (e.g. `pth_thread_exists`
+   only *compares* queue-node addresses, never dereferences and trusts a foreign
+   TCB). TSD key metadata originally violated this and had locking added (review
+   finding #3).
+
+### What work-stealing would require
+
+The pinning invariant is load-bearing for correctness, not just simplicity. If a
+future scheduler migrated a green thread from one OS thread to another (work
+stealing, load balancing), the migration point would need an explicit
+release/acquire pair: the losing scheduler must *release* after it stops running
+the thread, and the gaining scheduler must *acquire* before it resumes it, so the
+moved thread observes its own prior writes (which were performed on the other
+CPU). Concretely:
+
+* The steal hand-off must publish the TCB through an atomic (release) and the
+  thief must claim it through the matching atomic (acquire) -- a correctly
+  written lock-free run queue (e.g. a Chase-Lev deque) provides exactly this, as
+  Go's run-queue steal does.
+* Any per-thread state currently treated as single-writer (the event ring, the
+  TCB scheduling fields) would become multi-writer at the instant of the steal
+  and would need the same care, or a rule that a thread is only ever stolen while
+  quiescent (not mid-event-processing) with a full fence at the boundary.
+* `errno` and the machine context are already saved/restored per switch, so a
+  migrated thread carries them correctly; the missing piece is purely the
+  ordering fence at the steal, not extra saved state.
+
+Until then, pinning + single-writer ownership + atomic hand-offs is the whole of
+the model, and it is sufficient.
+
+### Validation (ThreadSanitizer)
+
+The reasoning above is checked empirically. `test_syncstress` spreads many
+workers across four schedulers, hammering shared data through `pth_mutex` and
+`pth_rwlock`, and is run under ThreadSanitizer in CI (the `tsan` job).
+
+A subtle point made this work without instrumenting the context switch: because
+threads are **pinned** (invariant 1), a given green thread's accesses all happen
+on one OS thread, and cooperative switches within a scheduler are sequential from
+that OS thread's point of view -- which is exactly how TSan already models an OS
+thread. So TSan's default per-OS-thread tracking is *correct* for this execution
+model, and no `__tsan_switch_to_fiber` annotations are needed. (They would be
+required for a work-stealing design where a green thread migrates between OS
+threads -- another way the pinning invariant simplifies correctness.) The only
+environmental wrinkle is that TSan needs reduced address-space randomization to
+map its shadow memory around Pth's heap-allocated thread stacks; the run uses
+`setarch -R` (and CI also lowers `vm.mmap_rnd_bits`).
+
+The exercise paid for itself immediately: TSan found a **real** MP race that the
+single-threaded original could not have had -- `mutex->mx_node` (the node that
+links a held mutex into its owner's `mutexring`) was appended/removed *outside*
+`mx_lock`, so two schedulers handing the same mutex back and forth raced on it.
+It was fixed by moving those ring operations inside the lock (`pth_sync.c`). Two
+non-atomic reads of atomically-written words (the spinlock's TTAS back-off read
+and the Treiber inbox head) were also made atomic.
+
+After those fixes the only remaining reports are two documented **benign** races,
+listed in `pth.tsan.supp` so the CI run gates on the absence of any *other*
+race: (a) the primitives read their state word to check the immutable
+`INITIALIZED` bit before taking the object's spinlock (they must -- the lock
+lives inside the object), which races with the `LOCKED`/`FAIR` bits being flipped
+under the lock but never observes a wrong value for the immutable bit; and (b)
+per-scheduler teardown during `pth_mp_shutdown` closes a self-pipe / frees the
+poller buffers after the schedulers have run dry. Neither affects live data. A
+full-atomic state word (a) and a two-phase shutdown (b) would remove even these,
+and are noted as possible future cleanups.
+
+### Throughput: same-scheduler vs cross-scheduler hand-off
+
+`test_syncbench` measures the cost of the wakeup substrate directly: two threads
+ping-pong a token through a mutex + directed condition-variable wakeup, first
+with both on one scheduler, then with one on each of two schedulers. A
+same-scheduler `pth_cond_notify` just moves a local green thread to the run
+queue (no OS-thread involvement); a cross-scheduler notify must push to the peer
+scheduler's lock-free inbox and write its self-pipe so it breaks out of
+`epoll_wait()`/`kevent()`/`select()`. Representative sandbox numbers (relative,
+not absolute -- they are machine dependent):
+
+| hand-off | throughput | relative |
+|----------|-----------:|---------:|
+| same-scheduler  | ~75k/s | 1.0x |
+| cross-scheduler | ~29k/s | ~0.37x (≈2.7x slower) |
+
+Two takeaways. First, cross-scheduler synchronization is roughly **2.5-3x**
+costlier per hand-off, entirely due to the self-pipe write + kernel wakeup +
+inbox drain; that is the price of waking a thread parked on a *different* CPU.
+Second, the number is essentially **the same on the epoll and select backends**,
+because the readiness backend is not on this path at all -- the cross-scheduler
+cost is the wakeup mechanism, not the fd poller. The practical guidance that
+falls out of this: co-locate tightly-coupled, chatty threads on the same
+scheduler (via `pth_spawn_on`) and reserve cross-scheduler placement for work
+that is either CPU-bound or communicates coarsely -- exactly the locality
+tradeoff every M:N runtime faces.
+
+## 25. How this design compares with Go, libev, libuv, and others
+
+It helps to place multi-scheduler Pth against the established options, because
+the comparison clarifies both what this work buys and where Pth deliberately
+stops.
+
+### The primary axis: stackful threads vs. stackless callbacks
+
+The single biggest distinction is not the fd backend but the *programming
+model*.
+
+* **Pth (and Go)** give you **stackful** cooperative threads: each thread has its
+  own stack, blocking calls *look* blocking (`pth_read()` just returns bytes),
+  and the runtime transparently suspends the stack at a blocking point and
+  resumes it later. You write ordinary sequential code.
+* **libev and libuv** are **stackless**, callback/event-driven loops: there is no
+  per-task stack; you register a callback for "fd readable" or "timer fired" and
+  the loop invokes it. Blocking-style code is impossible; you decompose logic
+  into continuations (or bolt a coroutine layer on top). libuv is the engine
+  under Node.js, so its model is JavaScript's callbacks/promises.
+
+Pth's reason to exist, then and now, is to let you keep straight-line,
+pthreads-style code (it even ships a `pthread` emulation) while getting
+cooperative scheduling. libev/libuv trade that ergonomics away for the raw
+efficiency and control of an explicit event loop.
+
+### Threading and parallelism
+
+* **Pth (this work):** M:N. N cooperative schedulers, each pinned to an OS
+  thread; green threads are pinned to a home scheduler; **no work-stealing, no
+  migration, no preemption**. Parallelism comes from placing threads on
+  different schedulers (`pth_spawn_on`), and it is the programmer's job to
+  balance them.
+* **Go:** also M:N (G goroutines : M OS threads : P processors), but far more
+  sophisticated: a **work-stealing** run-queue per P, **async preemption** (since
+  Go 1.14, via signals) so a CPU-bound goroutine cannot starve others, and
+  automatic load balancing across P's up to `GOMAXPROCS`.
+* **libev/libuv:** single-threaded loops. There is no M:N at all -- one loop
+  drives one OS thread. Multicore use means running several loops on several
+  threads and sharding work yourself (Node.js does this with the cluster/worker
+  model). libuv additionally keeps a **thread pool** for operations that have no
+  async kernel interface (file I/O, `getaddrinfo`), offloading them off the loop.
+
+The gaps this exposes in Pth are honest ones: **no preemption** (a compute-bound
+green thread that never hits a Pth call blocks its whole scheduler -- Go solves
+this, Pth does not), **no syscall hand-off** (Go moves a P to a fresh M when a
+goroutine blocks in a raw syscall so siblings keep running; Pth relies on its
+wrapped `pth_*` I/O calls to yield, and a *raw* blocking syscall stalls the
+scheduler), and **no thread-pool offload** for inherently-blocking work (libuv's
+answer for file I/O). These are the three biggest reasons Pth is not simply "a
+smaller Go".
+
+### The fd readiness backend
+
+Here the designs have converged, which is exactly what §23 was about:
+
+* **Pth (this work):** persistent-registration epoll/kqueue, one instance per
+  scheduler, with a poll/select fallback. This is new; classic Pth was
+  select-only.
+* **libev / libuv:** long-standing multi-backend abstraction over
+  epoll/kqueue/event ports/IOCP, with poll/select fallbacks -- essentially the
+  mature version of what Pth now has for one part of its loop.
+* **Go:** the **netpoller**, an epoll/kqueue/IOCP integration *fused into the
+  scheduler* -- when a goroutine's fd would block, it parks and the netpoller
+  later readies it, all without a dedicated poller thread.
+
+The important structural difference remains the one from §17/§23: Pth still walks
+its waiting queue in userspace each pass (persistent registration removed the
+*kernel* rescan, not the userspace one), whereas Go's netpoller and libuv's loop
+are event-driven end to end. Pth captured most of the kernel-side win without the
+full event-driven rewrite.
+
+### Waking one thread from another
+
+* **Pth:** a lock-free MPSC "inbox" (Treiber stack) carries the message and a
+  one-byte **self-pipe** write breaks the target scheduler out of
+  `epoll_wait()`. Push-before-kick ordering prevents lost wakeups.
+* **libuv:** `uv_async_t`, backed by an eventfd (Linux) or self-pipe -- the same
+  idea, standardized as a public handle type.
+* **Go:** integrated into the runtime -- goroutine parking/unparking uses futex-
+  based OS-thread notes and the netpoller; there is no user-visible self-pipe.
+
+Pth's mechanism is the classic, correct, portable one (§17 argued this at
+length); it is simply less integrated than a language runtime's.
+
+### Where Pth wins, and where it doesn't
+
+Pth's niche is real but narrow: a **tiny, portable, LGPL** library that offers
+**stackful, blocking-style cooperative threads with a POSIX `pthread` face**, now
+extended to real multicore -- with essentially no dependencies and a small enough
+codebase to audit in an afternoon. If you want pthreads semantics without kernel
+threads, deterministic cooperative scheduling, or a drop-in on an exotic
+platform, it fits.
+
+It does **not** compete with Go's runtime (preemption, work-stealing, integrated
+netpoller, syscall hand-off, a whole language and GC) or with libuv's breadth
+(thread-pool offload, IOCP/Windows, the enormous Node.js ecosystem). Nor does it
+try to. The multi-scheduler work brings Pth from "cooperative threads on one CPU,
+select-based" up to "cooperative threads across CPUs, epoll/kqueue-based" -- a
+meaningful modernization that closes the *biggest* historical gaps (single-CPU,
+FD_SETSIZE, ucontext portability) while consciously leaving the harder runtime
+features (preemption, stealing, offload) as future work rather than pretending to
+match a language runtime.
+
+## 26. Anachronisms: assumptions that made sense in 1999 but not today
+
+GNU Pth was written 1999-2006. Several of its design choices were correct for
+that era and are now either obsolete, already superseded by this project, or
+worth revisiting. This section catalogs them, partly as a guide to further
+modernization.
+
+### The premise itself has weakened
+
+Pth exists because, in 1999, kernel threads were heavy, non-portable, or absent:
+many Unixes had no usable threads at all, and where they existed (LinuxThreads,
+early pthreads) they were expensive and semantically rough. Userspace cooperative
+threads were a pragmatic answer. Today NPTL and modern kernels make 1:1 threads
+cheap and ubiquitous, so "threads where the OS has none" is rarely the motivation
+anymore. Pth's remaining value is narrower and more specific: deterministic
+cooperative scheduling, a tiny auditable footprint, a `pthread` face without
+kernel threads, and now -- via this work -- optional multicore. Worth stating
+plainly, because it should frame how much effort any further modernization
+deserves.
+
+### Already superseded by this project
+
+* **Single-CPU assumption.** The entire cooperative core assumed one CPU and thus
+  needed no synchronization at all. The multi-scheduler work (this document) adds
+  the atomics, spinlocks and memory model (§24) that a real SMP port requires --
+  `pth_atomic.h` did not exist before; classic Pth has literally zero atomic
+  operations.
+* **`select(2)` / `FD_SETSIZE`.** The original event loop was select-only, with
+  the hard `FD_SETSIZE` ceiling on descriptor *values*. §12/§23 add poll, then
+  persistent epoll/kqueue.
+* **`ucontext(3)` as the portable context primitive.** `makecontext`/
+  `swapcontext` was the "modern" choice in 1999; it is now deprecated (removed
+  from POSIX-2008 obsolescent, unusable on Apple Silicon). §22 adds the
+  Boost.Context `fcontext` method.
+* **`errno` treated as ordinary global.** Fine on one OS thread; the MP port
+  depends on it being thread-local (`__thread`), and the context methods now
+  save/restore it explicitly (§24, review R4).
+
+### Still legacy, not yet touched
+
+* **The machine-context dispatch zoo.** Beyond `mcsc`/`sjlj`/`bctx` there is a
+  whole `PTH_MCTX_DSP` matrix -- `sjljlx` (Linux-specific setjmp tricks),
+  `sjljisc` (InteractiveUNIX/ISC), `sjljw32` (Win32 setjmp), `ssjlj`/`usjlj`
+  (sigstack vs plain setjmp) -- plus `PTH_MCTX_STK` variants `sas`
+  (`sigaltstack`), `ss` (BSD `sigstack`). These exist to build stacks by bouncing
+  through a signal handler on platforms with no better primitive. On any current
+  target, `fcontext` (or `ucontext`) covers it; the setjmp-via-signal stack
+  bootstrap is dead weight for platforms that no longer ship.
+* **Sentinel stack guard instead of a guard page.** `pth_tcb_alloc` `malloc`s the
+  stack and writes a `0xDEAD` sentinel word (`stackguard`) at the end, checked
+  periodically to *detect* overflow after it has already happened. The modern
+  approach is an `mmap` region with a `PROT_NONE` guard page so an overflow
+  *faults* immediately (and never corrupts the heap). Especially relevant now
+  that stacks are shared-process resources under MP.
+* **The soft/hard syscall mapping.** `pth_syscall.c` `#define read
+  __pth_sys_read` etc., interposing on libc syscalls, plus a "hard" mode that
+  issues raw `syscall()` numbers. This machinery -- and the global symbol
+  interposition it implies -- is fragile against modern libc (cancellation
+  points, `open` vs `openat`, `syscall()` ABIs) and is largely a workaround for
+  1999-era libc integration that a small explicit `pth_*` wrapper set would do
+  more cleanly.
+* **Autoconf + `shtool` + `scpp`.** The build vendored `shtool` (a shell tool
+  multiplexer) and a custom C-preprocessor `scpp` to synthesize the internal
+  `pth_p.h` from `intern`-tagged sources. This is idiosyncratic and dated; the
+  CMake build used throughout this project is the modern replacement, and the
+  autoconf path lags it (e.g. it never learned `bctx`).
+* **Quaint scheduling heuristics.** The scheduler keeps a floating-point load
+  average (`loadval`) and a `favournew` bias to decide ordering -- 1999-flavored
+  heuristics with little grounding. A modern design would use a simpler,
+  well-understood policy (and, for multicore, the work-stealing / preemption
+  machinery Pth still lacks, §25).
+* **Dead-platform and niche support.** References to ISC, SCO, Win32 setjmp, and
+  optional GNU `sfio` integration target ecosystems that are effectively gone.
+  They are harmless but add configuration surface and testing burden for zero
+  real coverage.
+
+### Net
+
+The high-value anachronisms -- single-CPU, `select`/`FD_SETSIZE`, `ucontext`,
+non-atomic `errno` -- are exactly the ones this project addressed, because they
+blocked correctness or the multicore goal. The remainder (the mctx/stack dispatch
+zoo, sentinel guard, syscall interposition, the autoconf/`shtool`/`scpp` build,
+dead-platform support) are lower-stakes cleanups: each would shrink and modernize
+the codebase, none is required for correctness, and they are best done
+opportunistically rather than as a single sweep.

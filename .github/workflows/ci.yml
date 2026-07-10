@@ -87,3 +87,23 @@ jobs:
             cmake -G Ninja -S . -B build -DPTH_BUILD_TESTS=ON ${{ matrix.opts }}
             cmake --build build --parallel 2
             ctest --test-dir build --output-on-failure --timeout 180
+
+  # ---- ThreadSanitizer: cross-scheduler synchronization stress --------------
+  tsan:
+    name: "linux / ThreadSanitizer (MP sync stress)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lower mmap randomization for TSan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28 || true
+      - name: Configure (TSan)
+        run: >
+          cmake -S . -B build-tsan -DPTH_BUILD_TESTS=ON -DPTH_MP=ON -DPTH_SCHED_EPOLL=ON
+          -DCMAKE_C_FLAGS="-fsanitize=thread -O1 -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+      - name: Build the stress test
+        run: cmake --build build-tsan --target test_syncstress --parallel 2
+      - name: Run under ThreadSanitizer (known-benign races suppressed)
+        run: >
+          TSAN_OPTIONS="halt_on_error=1 suppressions=$PWD/pth.tsan.supp"
+          setarch $(uname -m) -R ./build-tsan/test_syncstress
