@@ -456,3 +456,58 @@ bctx build (vendored x86_64 ELF fcontext asm) running the MP suite +
 
 ### Low — CMake cache help omits bctx: FIXED
 The `PTH_MCTX_MTH` cache help now reads `"Force mctx method (mcsc, sjlj, bctx)"`.
+
+
+---
+
+## Fifth Follow-up Review: Open Findings
+
+Scope: committed changes after the previous review/resolution, especially the
+ThreadSanitizer stress coverage, new fd regression tests, supported-platform
+cleanup, and removal of the autoconf build. The current uncommitted
+`MULTISCHED-DESIGN.md` edit was also reviewed for consistency with those changes.
+
+### Medium: `test_badfd` passes when the operation times out
+
+`test_badfd.c` says that a bad descriptor must fail rather than hang, and gives
+`pth_select_ev()` a three-second timeout to turn a strand into a bounded test
+failure. However, the test increments `fails` only when `rc > 0`. If the bad-fd
+event is never delivered, the timeout event makes `pth_select_ev()` return zero
+and the test exits successfully. It also accepts any negative error even though
+the stated cross-backend contract and regression being tested are specifically
+an immediate `EBADF`.
+
+Consequently the test does not protect the liveness/failure behavior described
+in the third follow-up resolution: an evport regression that strands the fd
+until the auxiliary timeout will still print `ALL BADFD TESTS PASSED`. The test
+should require `rc == -1` and `errno == EBADF` (and ideally check that the timeout
+event did not occur).
+
+### Medium: broad function-level TSan suppressions can hide real primitive races
+
+`pth.tsan.supp` suppresses every race whose stack matches
+`pth_mutex_acquire`, `pth_mutex_release`, `pth_rwlock_acquire`,
+`pth_rwlock_release`, `pth_cond_await`, or `pth_cond_notify`. The justification
+mentions only the unlocked read of the immutable `INITIALIZED` bit, but a
+ThreadSanitizer `race:function` suppression is not restricted to that field or
+source line. It will also suppress a newly introduced race anywhere else in
+those functions, including precisely the waiter-queue, owner, count, or ring
+manipulations that the stress job is intended to police.
+
+This materially weakens the new CI gate: for example, another `mx_node` access
+moved outside `mx_lock` could be hidden instead of failing the job. Prefer
+removing the racy validation reads (for example by storing initialization in a
+separate immutable field/word or using atomic loads), or use a narrowly targeted
+suppression mechanism that cannot match unrelated accesses in the same public
+primitive functions.
+
+### Fifth Follow-up Verification Performed
+
+A fresh Linux build was configured in `/tmp/gnu-pth-review-latest` with
+`PTH_BUILD_TESTS=ON` and `PTH_BUILD_PTHREAD=ON`. Configuration selected the
+default MP + epoll backend; both libraries and all test binaries built
+successfully. Twenty tests reached completion and passed, including
+`test_badfd`, `test_closewait`, `test_syncstress`, and the MP synchronization and
+cancellation tests. `test_netio_mp` hit its 120-second CTest timeout in this
+restricted environment, matching the sandbox-sensitive limitation recorded in
+the earlier review; it is not reported here as a new product finding.
