@@ -1251,30 +1251,47 @@ shutdown would remove that final suppression and remains a possible cleanup.
 
 ### Throughput: same-scheduler vs cross-scheduler hand-off
 
-`test_syncbench` measures the cost of the wakeup substrate directly: two threads
-ping-pong a token through a mutex + directed condition-variable wakeup, first
-with both on one scheduler, then with one on each of two schedulers. A
-same-scheduler `pth_cond_notify` just moves a local green thread to the run
-queue (no OS-thread involvement); a cross-scheduler notify must push to the peer
-scheduler's lock-free inbox and write its self-pipe so it breaks out of
-`epoll_wait()`/`kevent()`/`select()`. Representative sandbox numbers (relative,
-not absolute -- they are machine dependent):
+`test_syncbench` measures a complete mutex + directed condition-variable
+handoff: two threads ping-pong a token, first on one scheduler and then across
+two schedulers. It is therefore not a pure mutex benchmark. A remote notify must
+push to the peer scheduler's lock-free inbox and write its self-pipe; a local
+notify only makes a green thread runnable.
 
-| hand-off | throughput | relative |
-|----------|-----------:|---------:|
-| same-scheduler  | ~75k/s | 1.0x |
-| cross-scheduler | ~29k/s | ~0.37x (≈2.7x slower) |
+The original GNU Pth `pth_cond_notify()` also called `pth_yield(NULL)` whenever
+it signalled a waiter. The first MP waiter-queue implementation preserved that
+policy for local waiters while remote delivery naturally returned without a
+local yield. This made the two benchmark paths semantically asymmetric. Because
+the conventional condition-variable pattern notifies while still holding the
+associated mutex, the eager local yield ran the waiter too soon: it woke, failed
+to reacquire the still-held mutex, queued again, and needed a second wake after
+the notifier resumed and released the mutex. This occurs with both mutex modes.
+The benchmark uses the default barging mutex; a fair mutex changes the second
+wake into direct ownership handoff but cannot eliminate the premature first
+wake and context switch.
 
-Two takeaways. First, cross-scheduler synchronization is roughly **2.5-3x**
-costlier per hand-off, entirely due to the self-pipe write + kernel wakeup +
-inbox drain; that is the price of waking a thread parked on a *different* CPU.
-Second, the number is essentially **the same on the epoll and select backends**,
-because the readiness backend is not on this path at all -- the cross-scheduler
-cost is the wakeup mechanism, not the fd poller. The practical guidance that
-falls out of this: co-locate tightly-coupled, chatty threads on the same
-scheduler (via `pth_spawn_on`) and reserve cross-scheduler placement for work
-that is either CPU-bound or communicates coarsely -- exactly the locality
-tradeoff every M:N runtime faces.
+On native Linux that legacy path reproducibly made the nominally cheaper local
+case slower (about 69--72k handoffs/s locally versus 121--126k/s remotely). This
+does not show that cross-scheduler mutexes are intrinsically faster; it exposes
+the eager-yield penalty and invalidates a direct interpretation of the old
+numbers as cross-scheduler overhead.
+
+The default behavior now makes local waiters runnable without yielding inside
+`pth_cond_notify()`. The notifying thread continues until its next ordinary Pth
+scheduling point, normally releasing the associated mutex first. Condition-
+variable correctness does not require the waiter to run before notify returns,
+but the policy change can delay a waiter if a CPU-bound notifier performs no
+further cooperative scheduling operation. Applications that relied on notify
+itself as a scheduling point can retain the historical behavior with:
+
+```
+cmake -S . -B build -DPTH_COND_LEGACY_YIELD=ON
+```
+
+The option applies consistently to both `libpth` and the pthread-emulation
+library. It is off by default because avoiding a guaranteed wake/block/wake
+cycle is the better policy for normal notify-while-locked usage. Benchmark
+results must state this option, and `test_syncbench` should be understood as a
+synchronization-handoff benchmark rather than a standalone mutex-cost test.
 
 ## 25. How this design compares with Go, libev, libuv, and others
 

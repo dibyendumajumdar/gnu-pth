@@ -616,9 +616,17 @@ int pth_cond_notify(pth_cond_t *cond, int broadcast)
             break;
     }
 
-    /* give threads woken on our own scheduler a chance to awake */
+    /* Compatibility with original GNU Pth scheduling semantics.  This eager
+       yield can make a waiter run while the notifying thread still holds the
+       associated mutex, forcing it to block a second time.  The default is to
+       make the waiter runnable and let the notifier reach its next scheduling
+       point (normally after releasing that mutex). */
+#if defined(PTH_COND_LEGACY_YIELD)
     if (wokelocal)
         pth_yield(NULL);
+#else
+    (void)wokelocal;
+#endif
 
     /* return to caller */
     return TRUE;

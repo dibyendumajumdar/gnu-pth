@@ -562,3 +562,24 @@ that cross-scheduler mutexes are intrinsically faster. The eager local yield in
 `pth_cond_notify()` should be reconsidered (especially for the conventional
 notify-while-holding-the-mutex pattern), and the benchmark should be rerun or
 redesigned after both paths have equivalent scheduling semantics.
+
+
+---
+
+## Sixth Follow-up Resolution
+
+### Medium — asymmetric eager yield distorts `test_syncbench`: FIXED
+
+The default `pth_cond_notify()` path now makes local waiters runnable without
+immediately yielding while the notifier may still hold the associated mutex.
+This removes the redundant wake/block/wake cycle and gives local and remote
+notifications equivalent asynchronous scheduling semantics. Original GNU Pth
+behavior remains available at build time with
+`-DPTH_COND_LEGACY_YIELD=ON`; the option applies to both `libpth` and the pthread
+emulation.
+
+`MULTISCHED-DESIGN.md` now records the legacy origin, the MP asymmetry, behavior
+with barging and fair mutexes, the possible latency impact for a notifier that
+does not reach another cooperative scheduling point, and the fact that
+`test_syncbench` measures a complete mutex/condition-variable handoff rather
+than mutex cost alone.
