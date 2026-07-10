@@ -952,9 +952,8 @@ with an application's own Boost.Context.
 `bctx` is the *default on macOS* and a fallback elsewhere, selectable anywhere
 with `-DPTH_MCTX_MTH=bctx`, and is now accepted by the `PTH_MP` requirement
 check alongside `mcsc`. The full MP test suite passes with `bctx` as the context
-method on Linux/x86_64; macOS is exercised via CI. (The autoconf build still
-selects `mcsc`/`sjlj` only; `bctx` is wired through the CMake build, which is the
-supported build for this fork.)
+method on Linux/x86_64; macOS is exercised via CI. (CMake is the sole build
+system; the old autoconf build, which never learned `bctx`, has been removed.)
 
 ## 23. Scalable fd readiness: the epoll(7)/kqueue(2) scheduler backends (default on Linux / *BSD·macOS)
 
@@ -1421,6 +1420,12 @@ deserves.
 * **`errno` treated as ordinary global.** Fine on one OS thread; the MP port
   depends on it being thread-local (`__thread`), and the context methods now
   save/restore it explicitly (§24, review R4).
+* **Autoconf as the build system.** The autoconf/libtool build (`configure.ac`,
+  `aclocal.m4`, `libtool.m4`, `ltmain.sh`, `pth-config`/`pthread-config`,
+  `pth.spec`, etc.) never learned `bctx` or the epoll/kqueue backends and has
+  been removed outright; CMake (see INSTALL) is now the only build system. The
+  `shtool`/`scpp` step that synthesizes `pth_p.h` from `intern`-tagged sources
+  is retained -- CMake still shells out to it -- it was never autoconf-specific.
 
 ### Still legacy, not yet touched
 
@@ -1445,11 +1450,6 @@ deserves.
   points, `open` vs `openat`, `syscall()` ABIs) and is largely a workaround for
   1999-era libc integration that a small explicit `pth_*` wrapper set would do
   more cleanly.
-* **Autoconf + `shtool` + `scpp`.** The build vendored `shtool` (a shell tool
-  multiplexer) and a custom C-preprocessor `scpp` to synthesize the internal
-  `pth_p.h` from `intern`-tagged sources. This is idiosyncratic and dated; the
-  CMake build used throughout this project is the modern replacement, and the
-  autoconf path lags it (e.g. it never learned `bctx`).
 * **Quaint scheduling heuristics.** The scheduler keeps a floating-point load
   average (`loadval`) and a `favournew` bias to decide ordering -- 1999-flavored
   heuristics with little grounding. A modern design would use a simpler,
@@ -1463,9 +1463,10 @@ deserves.
 ### Net
 
 The high-value anachronisms -- single-CPU, `select`/`FD_SETSIZE`, `ucontext`,
-non-atomic `errno` -- are exactly the ones this project addressed, because they
-blocked correctness or the multicore goal. The remainder (the mctx/stack dispatch
-zoo, sentinel guard, syscall interposition, the autoconf/`shtool`/`scpp` build,
-dead-platform support) are lower-stakes cleanups: each would shrink and modernize
-the codebase, none is required for correctness, and they are best done
-opportunistically rather than as a single sweep.
+non-atomic `errno`, the autoconf build -- are exactly the ones this project
+addressed, because they blocked correctness, the multicore goal, or had a
+maintained modern replacement. The remainder (the mctx/stack dispatch zoo,
+sentinel guard, syscall interposition, dead-platform support) are lower-stakes
+cleanups: each would shrink and modernize the codebase, none is required for
+correctness, and they are best done opportunistically rather than as a single
+sweep.
