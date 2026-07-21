@@ -31,6 +31,19 @@
 #error "PTH_MP requires GCC/Clang __atomic builtins"
 #endif
 
+#include <sched.h>   /* sched_yield() */
+#include <time.h>    /* nanosleep()   */
+
+/* CPU spin-wait hint (portable; a no-op on architectures without one). Not a
+   memory barrier by itself -- the atomic load in the spin loop provides that. */
+#if defined(__i386__) || defined(__x86_64__)
+#  define PTH_CPU_RELAX() __asm__ __volatile__("pause" ::: "memory")
+#elif defined(__aarch64__) || defined(__arm__)
+#  define PTH_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#else
+#  define PTH_CPU_RELAX() ((void)0)
+#endif
+
 /* thread-local storage class */
 #define PTH_TLS __thread
 
@@ -65,8 +78,15 @@ static inline void *pth_atomic_ptr_load(void * volatile *p)
 /*
  * spinlock on a plain `volatile int' word (test-and-test-and-set).
  * Hold times are O(1) list operations and a lightweight thread never
- * context-switches while holding one, so spinning is appropriate.
+ * context-switches while holding one, so spinning is appropriate.  Under
+ * cross-scheduler contention the wait backs off progressively -- CPU pause,
+ * then sched_yield(2), then a short nanosleep(2) -- so a hot lock neither
+ * saturates the cache interconnect nor busy-burns a core while an OS-preempted
+ * holder is off-CPU.  All three steps are portable (Linux/FreeBSD/macOS); no
+ * futex/_umtx_op/__ulock dependency.  See MULTISCHED-DESIGN.md section 27.
  */
+#define PTH_SPIN_SPINS  256    /* CPU-pause iterations before yielding    */
+#define PTH_SPIN_YIELDS  64    /* sched_yield() rounds before napping     */
 #define PTH_SPIN_INIT 0
 static inline void pth_spin_init(volatile int *l)
 {
@@ -78,11 +98,25 @@ static inline int pth_spin_trylock(volatile int *l)
 }
 static inline void pth_spin_lock(volatile int *l)
 {
+    unsigned int n = 0;
     for (;;) {
         if (pth_spin_trylock(l))
             return;
-        while (__atomic_load_n(l, __ATOMIC_RELAXED) != 0)
-            /* spin on the (relaxed) read before retrying the RMW */ ;
+        /* test-and-test-and-set: spin on a cached relaxed read, escalating
+           the back-off the longer the lock stays contended */
+        while (__atomic_load_n(l, __ATOMIC_RELAXED) != 0) {
+            if (n < PTH_SPIN_SPINS)
+                PTH_CPU_RELAX();
+            else if (n < PTH_SPIN_SPINS + PTH_SPIN_YIELDS)
+                sched_yield();
+            else {
+                struct timespec ts;
+                ts.tv_sec  = 0;
+                ts.tv_nsec = 100L * 1000L;   /* 100us */
+                (void)nanosleep(&ts, NULL);
+            }
+            n++;
+        }
     }
 }
 static inline void pth_spin_unlock(volatile int *l)

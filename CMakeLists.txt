@@ -502,7 +502,7 @@ if(PTH_BUILD_TESTS)
     enable_testing()
     foreach(t test_std test_mp test_misc test_philo test_sig
               test_select test_httpd test_uctx test_sync test_mutexfair test_pollfd test_badfd test_closewait
-              test_syncbench)
+              test_syncbench test_mutexcontend)
         add_executable(${t} ${t}.c test_common.c)
         target_link_libraries(${t} PRIVATE pth)
     endforeach()

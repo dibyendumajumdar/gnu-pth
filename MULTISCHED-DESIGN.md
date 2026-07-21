@@ -1484,3 +1484,97 @@ sentinel guard, syscall interposition, dead-platform support) are lower-stakes
 cleanups: each would shrink and modernize the codebase, none is required for
 correctness, and they are best done opportunistically rather than as a single
 sweep.
+
+## 27. Why spinlocks (not pthread mutexes) for cross-scheduler locks, and the back-off
+
+The internal cross-scheduler critical sections (a mutex's `mx_lock`, a cond's
+`cn_lock`, the message-port locks, the join lock) are guarded by the `pth_spin_*`
+spinlocks from `pth_atomic.h`, never by pthread mutexes. This section records why,
+and how the spin-wait avoids the usual contention pitfalls.
+
+### Why the core cannot/should not use pthread mutexes
+
+Two independent reasons, one hard and one prudential:
+
+1. **Symbol shadowing (hard, in the emulation build).** The optional pthreads
+   emulation (`pthread.c`) *owns* the `pthread_mutex_lock`/`_init`/... symbols.
+   If the core called `pthread_mutex_lock`, it would bind to Pth's own
+   *cooperative* implementation, not an OS mutex -- circular and wrong for
+   cross-OS-thread mutual exclusion. Reaching the real ones would require
+   `dlsym(RTLD_NEXT, ...)` plus runtime init (no `PTHREAD_MUTEX_INITIALIZER`,
+   since that macro is shadowed too) and a function-pointer call on every
+   lock/unlock. This is exactly why the OS-thread lifecycle calls
+   (`pthread_create`/`join`/`sigmask`) already go through `dlsym(RTLD_NEXT)`.
+2. **Blocking an OS thread is a foot-gun in a cooperative runtime (prudential).**
+   A scheduler is one OS thread multiplexing many green threads. Holding a
+   *blocking* OS mutex across a green-thread switch or a scheduler park would
+   freeze the whole OS thread -- and another green thread on that scheduler
+   trying to take it would deadlock the OS thread against itself. Spinlocks make
+   the "never hold across a block" rule self-evident and the holds trivially
+   short.
+
+Note the distinction: the *user-facing* `pth_mutex` genuinely cannot be a pthread
+mutex -- it must suspend the *green thread* and let the scheduler run others, not
+block the OS thread. That is a hard semantic requirement. The spinlock-vs-mutex
+choice only exists for the tiny *internal* locks, where -- given the "released
+before any park" discipline the code already follows -- a real (dlsym'd) OS mutex
+would be *correct*, just the wrong tool.
+
+### Why spinlocks are the right tool here
+
+- Same-scheduler contention is impossible (cooperative serialization), so
+  contenders are only other schedulers -- at most `N-1` of them, `N` ≈ nproc.
+- Critical sections are O(1) (a few pointer ops) -> short holds -> short spins.
+- The architecture deliberately minimizes cross-scheduler sharing (single-writer
+  TCBs, message-passing inbox), so most of these locks are uncontended.
+- Test-and-test-and-set already spins on a cached read, limiting cache-line
+  bouncing versus a naive test-and-set.
+
+They also compose with the memory model (section 24): the lock is a
+`__atomic_test_and_set(ACQUIRE)` / `__atomic_clear(RELEASE)` pair, and the
+lock-free wakeup inbox needs atomics regardless, so `pth_atomic.h` is unavoidable.
+
+### The contention concern, and the portable back-off
+
+A pure, no-back-off spinlock scales badly under two conditions: a genuinely *hot*
+cross-scheduler lock (many schedulers hammering one mutex -> cache-line ping-pong,
+wasted cycles, no fairness), and **lock-holder preemption** (the OS preempts a
+scheduler mid-critical-section -- likely on a loaded box or with
+`PTH_SCHEDULERS > nproc` -- so every other core spins uselessly until it is
+rescheduled).
+
+`pth_spin_lock` therefore backs off progressively, all with portable primitives:
+
+1. **CPU pause hint** (`pause` on x86, `yield` on arm64; no-op elsewhere) for the
+   first `PTH_SPIN_SPINS` iterations -- cuts coherency traffic, frees SMT
+   siblings, saves power.
+2. **`sched_yield(2)`** for the next `PTH_SPIN_YIELDS` rounds -- gives the OS a
+   chance to run the (possibly preempted) holder; this is the step that helps
+   lock-holder preemption and oversubscription.
+3. **short `nanosleep(2)`** (100us) as a last resort under pathological
+   contention.
+
+`sched_yield`/`nanosleep` are POSIX and present on Linux, FreeBSD and macOS.
+
+### Why not a futex-style parking lock
+
+A true "sleep on the lock word" (park/wake) would be strictly better under heavy
+contention, but there is **no portable primitive**: it is `futex(2)` on Linux,
+`_umtx_op(2)` on FreeBSD, and on macOS either the *private/undocumented*
+`__ulock_wait`/`__ulock_wake` or `os_sync_wait_on_address` (public only since
+macOS 14.4). That is three per-OS backends with the macOS one on shaky ground --
+precisely the machinery C++20's `std::atomic::wait/notify` hides, which we would
+have to hand-roll in C. It is deferred: if the contention benchmark ever shows the
+`sched_yield` hybrid is insufficient for a real workload, a `pth_park_on_address`
+/ `pth_wake_address` abstraction can be slotted *behind the same spinlock API*
+without touching any call site. Until measured need, the portable adaptive
+back-off is the right trade.
+
+### Measuring it
+
+`test_mutexcontend` is a microbenchmark: many workers all hammer one shared
+`pth_mutex`, run first with every worker on a single scheduler (cooperative, so
+the internal spinlock is never cross-CPU-contended) and then spread over `N`
+schedulers (real contention). The ratio is the contended-lock overhead to watch;
+on a 2-core sandbox it already shows a visible throughput drop, and it is the
+number against which any future parking lock should be judged.
