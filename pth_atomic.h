@@ -31,9 +31,6 @@
 #error "PTH_MP requires GCC/Clang __atomic builtins"
 #endif
 
-#include <sched.h>   /* sched_yield() */
-#include <time.h>    /* nanosleep()   */
-
 /* CPU spin-wait hint (portable; a no-op on architectures without one). Not a
    memory barrier by itself -- the atomic load in the spin loop provides that. */
 #if defined(__i386__) || defined(__x86_64__)
@@ -43,6 +40,14 @@
 #else
 #  define PTH_CPU_RELAX() ((void)0)
 #endif
+
+/* Real-OS thread yield for the spin-wait back-off, defined out-of-line in
+   pth_util.c.  It must NOT be a bare sched_yield()/nanosleep() here: the
+   pthread-emulation header macro-rewrites sched_yield to the cooperative
+   pthread_yield_np, and the hard-syscall layer wraps nanosleep -- either would
+   re-enter the Pth scheduler from inside a low-level lock (see REVIEW.md /
+   MULTISCHED-DESIGN.md section 27). */
+void pth_spin_yield(void);
 
 /* thread-local storage class */
 #define PTH_TLS __thread
@@ -79,14 +84,13 @@ static inline void *pth_atomic_ptr_load(void * volatile *p)
  * spinlock on a plain `volatile int' word (test-and-test-and-set).
  * Hold times are O(1) list operations and a lightweight thread never
  * context-switches while holding one, so spinning is appropriate.  Under
- * cross-scheduler contention the wait backs off progressively -- CPU pause,
- * then sched_yield(2), then a short nanosleep(2) -- so a hot lock neither
- * saturates the cache interconnect nor busy-burns a core while an OS-preempted
- * holder is off-CPU.  All three steps are portable (Linux/FreeBSD/macOS); no
- * futex/_umtx_op/__ulock dependency.  See MULTISCHED-DESIGN.md section 27.
+ * cross-scheduler contention the wait backs off -- CPU pause, then a real OS
+ * thread yield (pth_spin_yield) -- so a hot lock neither saturates the cache
+ * interconnect nor busy-burns a core while an OS-preempted holder is off-CPU.
+ * Both steps are portable (Linux/FreeBSD/macOS) and, crucially, never re-enter
+ * the Pth scheduler.  See MULTISCHED-DESIGN.md section 27.
  */
-#define PTH_SPIN_SPINS  256    /* CPU-pause iterations before yielding    */
-#define PTH_SPIN_YIELDS  64    /* sched_yield() rounds before napping     */
+#define PTH_SPIN_SPINS  256    /* CPU-pause iterations before yielding to the OS */
 #define PTH_SPIN_INIT 0
 static inline void pth_spin_init(volatile int *l)
 {
@@ -102,19 +106,13 @@ static inline void pth_spin_lock(volatile int *l)
     for (;;) {
         if (pth_spin_trylock(l))
             return;
-        /* test-and-test-and-set: spin on a cached relaxed read, escalating
-           the back-off the longer the lock stays contended */
+        /* test-and-test-and-set: spin on a cached relaxed read, then yield the
+           OS thread once the lock stays contended (never a cooperative yield) */
         while (__atomic_load_n(l, __ATOMIC_RELAXED) != 0) {
             if (n < PTH_SPIN_SPINS)
                 PTH_CPU_RELAX();
-            else if (n < PTH_SPIN_SPINS + PTH_SPIN_YIELDS)
-                sched_yield();
-            else {
-                struct timespec ts;
-                ts.tv_sec  = 0;
-                ts.tv_nsec = 100L * 1000L;   /* 100us */
-                (void)nanosleep(&ts, NULL);
-            }
+            else
+                pth_spin_yield();
             n++;
         }
     }

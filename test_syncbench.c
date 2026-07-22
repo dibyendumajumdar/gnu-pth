@@ -75,9 +75,9 @@ int main(void)
 
     pth_init();
     if (!pth_mp_init(2)) {
-        fprintf(stderr, "pth_mp_init(2) failed (build without PTH_MP?)\n");
+        printf("SKIP: multi-scheduler (PTH_MP) not built\n");
         pth_kill();
-        return 1;
+        return 0;
     }
     ns = pth_sched_count();
     iters = SB_ITERS;

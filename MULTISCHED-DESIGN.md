@@ -1543,18 +1543,31 @@ scheduler mid-critical-section -- likely on a loaded box or with
 `PTH_SCHEDULERS > nproc` -- so every other core spins uselessly until it is
 rescheduled).
 
-`pth_spin_lock` therefore backs off progressively, all with portable primitives:
+`pth_spin_lock` therefore backs off in two portable stages:
 
 1. **CPU pause hint** (`pause` on x86, `yield` on arm64; no-op elsewhere) for the
    first `PTH_SPIN_SPINS` iterations -- cuts coherency traffic, frees SMT
    siblings, saves power.
-2. **`sched_yield(2)`** for the next `PTH_SPIN_YIELDS` rounds -- gives the OS a
-   chance to run the (possibly preempted) holder; this is the step that helps
-   lock-holder preemption and oversubscription.
-3. **short `nanosleep(2)`** (100us) as a last resort under pathological
-   contention.
+2. **A real OS-thread yield** (`sched_yield(2)`) once the lock stays contended --
+   gives the OS a chance to run the (possibly preempted) holder; this is the step
+   that helps lock-holder preemption and oversubscription.
 
-`sched_yield`/`nanosleep` are POSIX and present on Linux, FreeBSD and macOS.
+Both are portable (Linux/FreeBSD/macOS). Crucially, **every back-off step must be
+an OS-level action, never a Pth cooperative yield/sleep** -- otherwise a contended
+*internal* lock could re-enter the scheduler from inside lock acquisition. That is
+a real hazard here because Pth interposes on the obvious primitives: the
+hard-syscall layer wraps `nanosleep` (-> `pth_nanosleep` -> `pth_wait`), and the
+pthreads-emulation header macro-rewrites `sched_yield` to the cooperative
+`pthread_yield_np` (and `pthread.c` includes that header *before* `pth_p.h`, so
+the macro is already live when `pth_atomic.h` is parsed there). For that reason
+the yield is not a bare call in the header: `pth_spin_lock` calls
+`pth_spin_yield()`, defined out-of-line in `pth_util.c` -- a translation unit that
+includes neither the emulation header nor triggers the syscall wrappers -- so it
+always resolves to the real OS `sched_yield`. An earlier revision also had a
+`nanosleep(2)` last-resort tier; it was removed precisely because that call bound
+to Pth's own interposed `nanosleep` wrapper (a review finding). Under sustained
+pathological contention the yield tier simply repeats -- still an OS-level
+action -- and the real fix for that regime is the parking lock below.
 
 ### Why not a futex-style parking lock
 

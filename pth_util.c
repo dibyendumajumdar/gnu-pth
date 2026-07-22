@@ -27,6 +27,21 @@
                                              -- D.E.Knuth */
 #include "pth_p.h"
 
+#if defined(PTH_MP)
+#include <sched.h>
+/*
+ * Real-OS thread yield used by the spin-wait back-off in pth_atomic.h.  Defined
+ * in this translation unit precisely because it includes neither <pthread.h>
+ * (whose emulation macro rewrites sched_yield -> the cooperative
+ * pthread_yield_np) nor forces the hard-syscall nanosleep wrapper, so a
+ * contended internal spinlock can never re-enter the Pth cooperative scheduler.
+ */
+void pth_spin_yield(void)
+{
+    sched_yield();
+}
+#endif
+
 /* calculate numerical mimimum */
 #if cpp
 #define pth_util_min(a,b) \

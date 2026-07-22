@@ -656,3 +656,37 @@ correctness gate for throughput.
 
 I reviewed the latest diff statically on the local Windows workspace. I did not
 run the Linux CMake matrix in this environment.
+
+
+---
+
+## Seventh Follow-up Resolution
+
+### High — spinlock backoff re-enters Pth via the interposed `nanosleep`: FIXED
+The `nanosleep(2)` last-resort tier was removed from `pth_spin_lock()`
+(`pth_atomic.h`). Investigation showed the hazard is broader than `nanosleep`:
+the pthreads-emulation header also macro-rewrites `sched_yield` to the
+cooperative `pthread_yield_np`, and `pthread.c` includes that header *before*
+`pth_p.h`, so a bare `sched_yield()` in the header would likewise re-enter the
+scheduler in the emulation build. The back-off is now two portable stages -- CPU
+pause, then a real OS-thread yield -- and the yield is routed through a new
+out-of-line helper `pth_spin_yield()` defined in `pth_util.c`, a translation unit
+that includes neither `<pthread.h>` nor forces the hard-syscall wrappers. It
+therefore always resolves to the real OS `sched_yield`, and no back-off step can
+enter `pth_wait()`/`pth_yield()`. `pth_atomic.h` no longer names
+`sched_yield`/`nanosleep` at all. Verified: `pth_atomic.h` compiles standalone
+(`-Wall -Wextra`) exercising the pause -> `pth_spin_yield` path; full CMake matrix
+via CI.
+
+### Medium — `test_mutexcontend` requires MP but is built for non-MP: FIXED
+Both contention benchmarks (`test_mutexcontend` and `test_syncbench`) now print
+`SKIP` and exit 0 when `pth_mp_init()` reports that MP is unavailable, instead of
+returning failure, so they are benign in a single-scheduler build regardless of
+how they are registered.
+
+### Assessment note
+The reviewer's assessment is adopted: a test-and-test-and-set spinlock with
+bounded adaptive back-off is the right default, **every back-off step must be an
+OS-level action (never a Pth cooperative yield/sleep)**, and the microbenchmark
+is a trend signal rather than a throughput correctness gate. `MULTISCHED-DESIGN.md`
+section 27 was updated to state that invariant explicitly.

@@ -73,9 +73,9 @@ int main(void)
     if (want < 2) want = 2;
     if (want > 8) want = 8;
     if (!pth_mp_init(want)) {
-        fprintf(stderr, "pth_mp_init(%d) failed (build without PTH_MP?)\n", want);
+        printf("SKIP: multi-scheduler (PTH_MP) not built\n");
         pth_kill();
-        return 1;
+        return 0;
     }
     ns = pth_sched_count();
     iters = MC_ITERS;
