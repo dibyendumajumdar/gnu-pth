@@ -583,3 +583,76 @@ with barging and fair mutexes, the possible latency impact for a notifier that
 does not reach another cooperative scheduling point, and the fact that
 `test_syncbench` measures a complete mutex/condition-variable handoff rather
 than mutex cost alone.
+
+---
+
+## Seventh Follow-up Review: Spinlock Contention Backoff
+
+Scope: latest change adding adaptive backoff to `pth_spin_lock()`
+(`pth_atomic.h`), the new `test_mutexcontend` benchmark, and the new
+`MULTISCHED-DESIGN.md` section 27 covering spinlock alternatives.
+
+### High: spinlock backoff can re-enter Pth through the hard `nanosleep` wrapper
+
+`pth_spin_lock()` now escalates to `nanosleep()` after pause/yield rounds
+(`pth_atomic.h`). In a build with `PTH_SYSCALL_HARD=ON`, this project exports its
+own hard syscall wrapper named `nanosleep()` (`pth_syscall.c`), and that wrapper
+calls `pth_nanosleep()`. `pth_nanosleep()` builds a Pth time event and calls
+`pth_wait()`.
+
+That means a heavily contended internal spinlock can accidentally enter the
+cooperative scheduler while it is still inside the low-level lock acquisition
+path. This violates the design rule that internal spinlocks never park/yield a
+green thread, and can lead to surprising scheduler re-entry or deadlock depending
+on which internal lock is being acquired.
+
+The backoff sleep must bypass Pth's interposed syscall layer. Options include a
+small raw OS sleep helper implemented next to the existing hard-syscall escape
+machinery, using `syscall(SYS_nanosleep)` where available, resolving the real
+libc `nanosleep` through `dlsym`, or disabling the nanosleep tier when hard
+syscall mapping is enabled.
+
+### Medium: `test_mutexcontend` is built for non-MP configurations but requires MP
+
+`test_mutexcontend` is added to the common test executable list in
+`CMakeLists.txt`, outside the `if(PTH_MP)` block. The test unconditionally calls
+`pth_mp_init(want)` with `want >= 2` and exits with failure when that call fails.
+In a supported single-scheduler build (`-DPTH_MP=OFF`), the binary is still built
+and will fail if run directly; if it is later registered with CTest, the
+single-scheduler suite will fail for a test that cannot apply to that build.
+
+This should either be moved under the existing MP-only test block or return a
+skip/success result when `pth_mp_init(2+)` reports that MP is unavailable.
+
+### Assessment: alternatives to spinlocks
+
+The decision to keep spinlocks for these internal locks is still reasonable. The
+critical sections are intentionally tiny, no green-thread context switch should
+occur while they are held, and the pthread-emulation build makes ordinary
+`pthread_mutex_*` calls awkward because those symbols may refer to Pth's own
+cooperative pthread layer rather than the OS implementation.
+
+The main alternatives are:
+
+* A real OS mutex reached through `dlsym(RTLD_NEXT)` or a platform shim. This is
+  correct if the no-park-while-held discipline is maintained, but it adds runtime
+  symbol plumbing, blocks an entire scheduler OS thread under contention, and is
+  a heavier primitive for pointer-sized critical sections.
+* Futex-style parking locks. These are best under sustained heavy contention and
+  lock-holder preemption, but require per-platform backends (`futex`, `_umtx_op`,
+  macOS wait-on-address APIs) and more wakeup/lifetime complexity.
+* Queue locks such as MCS/ticket locks. These reduce cache-line bouncing or add
+  fairness, but they still spin when the holder is preempted and need per-waiter
+  state. They are worth considering only if benchmarks show cache contention, not
+  holder preemption, is the dominant problem.
+
+Given the current architecture, a test-and-test-and-set spinlock with bounded
+adaptive backoff is a good default. The important caveat is that every backoff
+step must be an OS-level action, not a Pth cooperative sleep/yield, and the
+microbenchmark should remain MP-only and be used as a trend signal rather than a
+correctness gate for throughput.
+
+### Seventh Follow-up Verification
+
+I reviewed the latest diff statically on the local Windows workspace. I did not
+run the Linux CMake matrix in this environment.
